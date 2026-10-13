@@ -58,7 +58,15 @@ The query boundary is the harness's: trace plus the selected and earlier source 
 
 ## Remaining Work
 
-- **Baseline PC measurements:** Repeat the performance measurements on the baseline Windows PC with a static-CRT release build, and record power mode and peak memory. Container results do not establish the release targets.
+- **Baseline PC measurements:** Repeat the performance measurements on the baseline Windows PC with a static-CRT release build, and record power mode and peak memory. Container results do not establish the release targets. From an x64 Visual Studio developer PowerShell in the project root, run the harness as follows, with new destination and cache paths each time:
+
+  ```powershell
+  .\scripts\dev.ps1 benchmark -Destination .local\benchmark-run
+  $env:RUSTFLAGS = '-C target-feature=+crt-static'
+  cargo run --release --locked -p git-scoop-core --example measure -- .local\benchmark-run .local\measure.db .local\measure.json
+  ```
+
+  The JSON report records the build profile, target, static-CRT setting, timings, cache size, and unknown commits. Peak process memory must be read separately, for example from Task Manager or Performance Monitor.
 - **UI responsiveness:** Measure UI input latency during analysis (target p95 within 100 ms) in the native window. Analysis and queries run off the UI thread, and every list renders only its visible rows, but this has not been measured.
 - **Visual QA:** Check scaling, Korean font fallback, keyboard operation, and click flows on Windows 11.
 - **Release packaging (CGE-012):** Excluded from this scope.

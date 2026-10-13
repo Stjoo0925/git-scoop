@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "seed": 196613,
+  "head": "3de2b6ccd14f2b3623c864d8f4887a227ea73991",
+  "commits": 1000,
+  "files": 200,
+  "source_bytes": 10485760,
+  "functions_per_file": 500
+}

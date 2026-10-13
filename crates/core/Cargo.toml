@@ -1,0 +1,23 @@
+[package]
+name = "git-scoop-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gix.workspace = true
+rusqlite.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+git-scoop-fixtures = { path = "../../tools/fixtures" }
+
+[lints]
+workspace = true

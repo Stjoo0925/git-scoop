@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/app", "crates/core", "tools/fixtures"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow"] }
+gix = { version = "=0.89.0", default-features = false, features = ["sha1", "sha256", "blob-diff"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+tree-sitter = "=0.27.1"
+tree-sitter-rust = "=0.24.2"
+blake3 = "1.8"
+tempfile = "3.23"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+

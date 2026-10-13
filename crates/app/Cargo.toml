@@ -1,0 +1,14 @@
+[package]
+name = "git-scoop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+git-scoop-core = { path = "../core" }
+
+[lints]
+workspace = true

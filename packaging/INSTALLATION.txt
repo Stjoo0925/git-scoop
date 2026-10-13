@@ -1,0 +1,39 @@
+Git Scoop for Windows 11 x64
+
+Installation is for the current user and does not require administrator rights.
+The default folder is %LOCALAPPDATA%\Programs\GitScoop. Launch Git Scoop
+from the Start menu. Close the app before installing an updated local package.
+No automatic updater or runtime network download is included.
+
+This build uses the static MSVC runtime. The package checks the executable's
+imports and refuses an executable that requires the Visual C++ redistributable.
+Windows 11 system libraries and a working graphics driver are required.
+
+Restart: close Git Scoop and reopen it from the Start menu. A Windows restart
+is normally unnecessary; follow the installer prompt if Windows requests one.
+
+Cache: analysis data is stored under %LOCALAPPDATA%\git-scoop\cache.
+To reset cached analysis, first close Git Scoop, open that exact folder in
+File Explorer and delete only its repository .db files and matching .db-wal
+and .db-shm files. Reopen Git Scoop and analyze the repository again.
+Uninstallation preserves the cache and never deletes source repositories.
+
+Uninstall using Windows Settings > Apps > Installed apps > Git Scoop,
+or the Uninstall Git Scoop shortcut. To remove remaining cached data,
+close Git Scoop and delete only the cache folder described above.
+
+Git Scoop is MIT licensed. See LICENSE.txt and THIRD-PARTY-NOTICES.txt.
+The installer is built using Inno Setup by Jordan Russell and Martijn Laan:
+https://jrsoftware.org/
+
+The embedded default fonts include Hack, Ubuntu, Noto Emoji and emoji-icon-font;
+their notices are included in THIRD-PARTY-NOTICES.txt. Microsoft Malgun Gothic
+is loaded from the Windows installation only and is not redistributed.
+
+Inno Setup 6.7.1's license.txt grants use and redistribution under its stated
+conditions, including retaining its copyright and website addresses. The
+vendor separately requests purchase for commercial compiler use:
+https://jrsoftware.org/isorder.php
+This locally validated package was created for the free MIT project. No
+commercial license was purchased and no public upload was authorized. A
+commercial release must review the vendor's current commercial-use terms.

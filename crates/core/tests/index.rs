@@ -197,3 +197,41 @@ fn assert_equal_edges(
     }
     Ok(())
 }
+
+#[test]
+fn every_fixture_analyzes_deterministically_with_explicit_skips() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("suite");
+    let suite = generate_suite(&root)?;
+    let cancel = AtomicBool::new(false);
+    let rule = index::rule_version();
+    for data in &suite.datasets {
+        let repository = root.join(&data.name);
+        let first = temporary.path().join(format!("{}-first.db", data.name));
+        let second = temporary.path().join(format!("{}-second.db", data.name));
+        let analysis = index::analyze(&repository, "HEAD", &first, &cancel, |_| {})?;
+        index::analyze(&repository, "HEAD", &second, &cancel, |_| {})?;
+        assert_equal_edges(&first, &second, data)?;
+        let target = analysis
+            .snapshot
+            .commit_id
+            .clone()
+            .context("Analyzed target")?;
+        if let Some(blob) = &data.unavailable_blob {
+            let store = SnapshotStore::open(&first)?;
+            ensure!(
+                store
+                    .load_states(&target, &target, &rule, EXTRACTOR_VERSION)?
+                    .iter()
+                    .any(|state| state.kind == "SkippedFile"
+                        && state.evidence.contains(blob.as_str())),
+                "The unavailable blob was not reported as skipped"
+            );
+            ensure!(
+                analysis.unknown_commits >= 1,
+                "A skipped file did not mark its commit incomplete"
+            );
+        }
+    }
+    Ok(())
+}

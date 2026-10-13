@@ -156,6 +156,23 @@ impl SnapshotStore {
         finish(transaction, &self.path, self.budget)
     }
 
+    /// Blob IDs whose parse results are cached for this extractor version.
+    pub fn cached_blobs(
+        &self,
+        version: ExtractorVersion,
+    ) -> Result<std::collections::HashSet<String>> {
+        let Some(version) = find_version(&self.connection, version)? else {
+            return Ok(std::collections::HashSet::new());
+        };
+        let mut statement = self
+            .connection
+            .prepare_cached("SELECT blob_id FROM parse_units WHERE version=?1")?;
+        let blobs = statement
+            .query_map([version], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(blobs)
+    }
+
     pub fn load_parse(
         &self,
         blob_id: &str,

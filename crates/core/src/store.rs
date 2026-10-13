@@ -129,7 +129,7 @@ impl SnapshotStore {
                 migrate_location_states(&transaction)?;
             }
             if version < 4 {
-                migrate_interned_versions(&transaction)?;
+                migrate_schema_four(&transaction)?;
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             finish(transaction, path, budget)?;
@@ -234,7 +234,7 @@ impl SnapshotStore {
                 &edge.after,
                 &edge.events,
                 &edge.evidence,
-                "automatic",
+                Decision::Automatic,
                 &request.rule_version,
                 &version,
             )?;
@@ -247,7 +247,7 @@ impl SnapshotStore {
                 &candidate.after,
                 &[],
                 &candidate.evidence,
-                "candidate",
+                Decision::Candidate,
                 &request.rule_version,
                 &version,
             )?;
@@ -295,7 +295,7 @@ impl SnapshotStore {
         rule_version: &str,
         version: ExtractorVersion,
     ) -> Result<Vec<StoredEdge>> {
-        self.query_edges(commit_id, rule_version, version, "automatic", None)
+        self.query_edges(commit_id, rule_version, version, Decision::Automatic, None)
     }
 
     pub fn file_blob(&self, commit_id: &str, path: &[u8]) -> Result<Option<String>> {
@@ -319,7 +319,7 @@ impl SnapshotStore {
             &location.commit_id,
             rule_version,
             version,
-            "automatic",
+            Decision::Automatic,
             Some(location),
         )?;
         ensure!(
@@ -336,7 +336,7 @@ impl SnapshotStore {
         version: ExtractorVersion,
     ) -> Result<Vec<StoredCandidate>> {
         Ok(self
-            .query_edges(commit_id, rule_version, version, "candidate", None)?
+            .query_edges(commit_id, rule_version, version, Decision::Candidate, None)?
             .into_iter()
             .map(|edge| StoredCandidate {
                 before: edge.before,
@@ -357,7 +357,7 @@ impl SnapshotStore {
                 &location.commit_id,
                 rule_version,
                 version,
-                "candidate",
+                Decision::Candidate,
                 Some(location),
             )?
             .into_iter()
@@ -488,7 +488,7 @@ impl SnapshotStore {
         commit_id: &str,
         rule_version: &str,
         version: ExtractorVersion,
-        decision: &str,
+        decision: Decision,
         location: Option<&StoredLocation>,
     ) -> Result<Vec<StoredEdge>> {
         let Some(version) = find_version(&self.connection, version)? else {
@@ -499,24 +499,25 @@ impl SnapshotStore {
         } else {
             ""
         };
+        let decision = decision.sql();
         let sql=format!("SELECT e.edge_id,a.commit_id,a.path,a.blob_id,a.symbol_index,
             b.commit_id,b.path,b.blob_id,b.symbol_index,v.evidence FROM lineage_edges e
             JOIN observations a ON a.observation_id=e.before_id JOIN observations b ON b.observation_id=e.after_id
-            JOIN match_evidence v ON v.edge_id=e.edge_id WHERE b.commit_id=?1 AND b.version=?3 AND e.rule_version=?2 AND e.version=?3 AND e.decision=?7
+            JOIN match_evidence v ON v.edge_id=e.edge_id WHERE b.commit_id=?1 AND b.version=?3 AND e.rule_version=?2 AND e.version=?3 AND e.decision='{decision}'
             {location_predicate} ORDER BY b.path,b.symbol_index,a.path,a.symbol_index");
         let mut statement = self.connection.prepare_cached(&sql)?;
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(commit_id.to_owned()),
+            Box::new(rule_version.to_owned()),
+            Box::new(version),
+        ];
+        if let Some(point) = location {
+            values.push(Box::new(point.path.clone()));
+            values.push(Box::new(point.blob_id.clone()));
+            values.push(Box::new(i64::try_from(point.symbol_index)?));
+        }
         let rows = statement.query_map(
-            params![
-                commit_id,
-                rule_version,
-                version,
-                location.map(|point| point.path.as_slice()),
-                location.map(|point| point.blob_id.as_str()),
-                location
-                    .map(|point| i64::try_from(point.symbol_index))
-                    .transpose()?,
-                decision
-            ],
+            rusqlite::params_from_iter(values.iter().map(|value| value.as_ref())),
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -715,6 +716,24 @@ fn insert_parse(
     Ok(())
 }
 
+/// Edge decisions are written into SQL as literals: `decision` selects the
+/// partial `automatic_predecessor` index, and SQLite reprepares a statement
+/// whenever a parameter that can change such an index choice is rebound.
+#[derive(Debug, Clone, Copy)]
+enum Decision {
+    Automatic,
+    Candidate,
+}
+
+impl Decision {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Candidate => "candidate",
+        }
+    }
+}
+
 fn version_key(version: ExtractorVersion) -> String {
     // JSON avoids collisions between version labels containing delimiters.
     serde_json::to_string(&(
@@ -746,10 +765,11 @@ fn intern_version(transaction: &Transaction<'_>, version: ExtractorVersion) -> R
     find_version(transaction, version)?.context("The extractor version was not interned.")
 }
 
-/// Replace full version keys written by schema 3 and earlier with interned
-/// identifiers. Interned identifiers are decimal and legacy keys are JSON
-/// arrays, so the two forms cannot be confused.
-fn migrate_interned_versions(transaction: &Transaction<'_>) -> Result<()> {
+/// Schema 4 replaces full version keys written by earlier schemas with
+/// interned identifiers and orders the state index by position. Interned
+/// identifiers are decimal and legacy keys are JSON arrays, so the two forms
+/// cannot be confused.
+fn migrate_schema_four(transaction: &Transaction<'_>) -> Result<()> {
     const TABLES: [&str; 6] = [
         "parse_units",
         "extracted_symbols",
@@ -758,7 +778,11 @@ fn migrate_interned_versions(transaction: &Transaction<'_>) -> Result<()> {
         "analysis_states",
         "checkpoints",
     ];
-    transaction.execute_batch("CREATE TABLE IF NOT EXISTS extractor_versions(version_id INTEGER PRIMARY KEY,key TEXT NOT NULL UNIQUE);")?;
+    // Ending the state index with position serves per-observation and
+    // commit-wide state queries in order without scanning every state.
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS extractor_versions(version_id INTEGER PRIMARY KEY,key TEXT NOT NULL UNIQUE);
+        DROP INDEX IF EXISTS states_observation;
+        CREATE INDEX states_observation ON analysis_states(target_id,commit_id,rule_version,version,observation_id,position);")?;
     // Parent and child keys change in separate statements within one transaction.
     transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
     for table in TABLES {
@@ -1014,10 +1038,11 @@ fn store_edge(
     after: &StoredLocation,
     events: &[String],
     evidence: &str,
-    decision: &str,
+    decision: Decision,
     rule: &str,
     version: &str,
 ) -> Result<()> {
+    let decision = decision.sql();
     let before_id = observation_id(transaction, before, version)?;
     let after_id = observation_id(transaction, after, version)?;
     let inserted = transaction.prepare_cached("INSERT OR IGNORE INTO lineage_edges(before_id,after_id,rule_version,version,decision) VALUES(?1,?2,?3,?4,?5)")?.execute(params![before_id,after_id,rule,version,decision])?;
@@ -1025,7 +1050,7 @@ fn store_edge(
     let id = if inserted == 1 {
         transaction.last_insert_rowid()
     } else {
-        let id:i64 = transaction.prepare_cached("SELECT edge_id FROM lineage_edges WHERE before_id=?1 AND after_id=?2 AND rule_version=?3 AND version=?4 AND decision=?5")?.query_row(params![before_id,after_id,rule,version,decision],|row|row.get(0))?;
+        let id:i64 = transaction.prepare_cached(&format!("SELECT edge_id FROM lineage_edges WHERE before_id=?1 AND after_id=?2 AND rule_version=?3 AND version=?4 AND decision='{decision}'"))?.query_row(params![before_id,after_id,rule,version],|row|row.get(0))?;
         transaction
             .prepare_cached("DELETE FROM events WHERE edge_id=?1")?
             .execute([id])?;

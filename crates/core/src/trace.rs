@@ -52,15 +52,6 @@ pub fn trace(
             "The cached lineage is outside the selected first-parent path."
         );
         let edge = store.preceding_edge(&current, &rule, EXTRACTOR_VERSION)?;
-        let candidates = store.load_location_candidates(&current, &rule, EXTRACTOR_VERSION)?;
-        let mut states =
-            store.load_location_states(&selected.commit_id, &current, &rule, EXTRACTOR_VERSION)?;
-        states.extend(store.load_global_states(
-            &selected.commit_id,
-            &current.commit_id,
-            &rule,
-            EXTRACTOR_VERSION,
-        )?);
         let same_blob = if let Some(parent) = history.commits.get(index + 1) {
             store
                 .file_blob(&parent.commit_id, &current.path)?
@@ -69,6 +60,20 @@ pub fn trace(
             false
         };
         if index == 0 || edge.is_some() || !same_blob {
+            // Candidates and states are shown only on timeline entries.
+            let candidates = store.load_location_candidates(&current, &rule, EXTRACTOR_VERSION)?;
+            let mut states = store.load_location_states(
+                &selected.commit_id,
+                &current,
+                &rule,
+                EXTRACTOR_VERSION,
+            )?;
+            states.extend(store.load_global_states(
+                &selected.commit_id,
+                &current.commit_id,
+                &rule,
+                EXTRACTOR_VERSION,
+            )?);
             let parsed = store
                 .load_parse(&current.blob_id, EXTRACTOR_VERSION)?
                 .context("The symbol parse cache is unavailable. Reanalyze the repository.")?;

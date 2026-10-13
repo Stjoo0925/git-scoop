@@ -545,6 +545,17 @@ fn schema_two_migration_preserves_states_and_indexes_precise_locations() -> Resu
         .join(" ");
     assert!(plan.contains("states_observation"));
     assert!(plan.contains("observation_id=?"));
+    // Commit-wide states use the same index in position order, without a sort.
+    let mut statement=connection.prepare("EXPLAIN QUERY PLAN SELECT location,kind,evidence FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4 AND observation_id IS ?5 ORDER BY position")?;
+    let plan = statement
+        .query_map(
+            params!["target", "root", "rule-1", "version", Option::<i64>::None],
+            |row| row.get::<_, String>(3),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .join(" ");
+    assert!(plan.contains("states_observation"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     assert_eq!(
         scalar(&path, "SELECT COUNT(*) FROM pragma_foreign_key_check")?,
         0

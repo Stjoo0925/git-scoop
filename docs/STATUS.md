@@ -66,6 +66,8 @@ The query boundary is the harness's: trace plus the selected and earlier source 
 
 ## Remaining Work
 
+No development task remains outside packaging. The open items are confirmations on the user's baseline Windows PC, which DECISIONS.md fixes as the release measurement machine. The cloud development environments are Linux only, so these cannot run here, and they need no code changes unless a measurement fails.
+
 - **Baseline PC measurements:** Repeat the performance measurements on the baseline Windows PC with a static-CRT release build, and record power mode and peak memory. Container results do not establish the release targets. From an x64 Visual Studio developer PowerShell in the project root, run the harness as follows, with new destination and cache paths each time:
 
   ```powershell
@@ -76,4 +78,4 @@ The query boundary is the harness's: trace plus the selected and earlier source 
 
   The JSON report records the build profile, target, static-CRT setting, timings, cache size, and unknown commits. Peak process memory must be read separately, for example from Task Manager or Performance Monitor.
 - **Windows confirmation:** Repeat the UI latency measurement on the baseline PC, and confirm Malgun Gothic rendering and Windows display scaling in the native window. The same flows already pass headlessly and under X11.
-- **Release packaging (CGE-012):** Excluded from this scope.
+- **Release packaging (CGE-012):** Excluded from this scope, including CGE-011's check that the installed package works offline.

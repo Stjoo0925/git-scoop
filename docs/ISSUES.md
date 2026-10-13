@@ -86,7 +86,7 @@ Acceptance: resumption after cancellation or app exit matches a full run. Ignore
 
 P1 · Dependencies: 004, 008
 
-Status: implemented and tested. A keyboard-only flow test passes, and the native window was checked at scales 1.0, 1.5, and 2.0 with Korean paths and source under X11. Confirmation with Malgun Gothic and Windows display scaling remains.
+Status: implemented and tested. A keyboard-only flow test passes, and the native window was checked at scales 1.0, 1.5, and 2.0 with Korean paths and source under X11. Development is complete; confirming Malgun Gothic and Windows display scaling on the baseline PC remains.
 
 Build repository selection, ref/commit selection, file/symbol lists, name search, and analysis progress/cancellation/error display.
 
@@ -106,7 +106,7 @@ Acceptance: explore earlier source after name/file moves. Distinguish multiple e
 
 P1 · Dependencies: 008, 010
 
-Status: accuracy criteria met. Performance and UI input latency targets were met on the development container; baseline-PC and offline-package confirmation remain. [Development status](STATUS.md)
+Status: accuracy criteria met. Performance and UI input latency targets were met on the development container; development is complete. Confirmation on the baseline PC remains, and the offline package check belongs to CGE-012 packaging. [Development status](STATUS.md)
 
 Measure accuracy, initial analysis, cached queries, memory, cache, and UI responsiveness on the current development PC using fixed CGE-002 synthetic fixtures. Record actual PC specifications, power mode, build, and measurement conditions. Verify blocked-network operation and unchanged target repositories.
 

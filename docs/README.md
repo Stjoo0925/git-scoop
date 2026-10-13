@@ -26,7 +26,7 @@ Git Scoop is a native Rust application for offline Git exploration. Its core MVP
 
 A Cargo workspace and new Git repository were created at the confirmed location, `C:\Users\yusco\workdir\git-scoop`. The app title is Git Scoop; the directory and executable identifier is git-scoop. This chat's outputs directory contains the documents; the actual project is at the confirmed location.
 
-CGE-001 and CGE-002 are complete. The Windows MSVC toolchain and library combination were validated and pinned, and an app that explores symbols and source from the actual HEAD was built. Independent correctness datasets and an exact reproducible benchmark are available. All authored project text is English. Documents were copied to docs, and the root README, AGENTS.md, and MIT LICENSE were written. The next task is CGE-003 read-only Git access.
+CGE-001 and CGE-002 are complete. The Windows MSVC toolchain and library combination were validated and pinned, and an app that explores symbols and source from the actual HEAD was built. Independent correctness datasets and an exact reproducible benchmark are available. All authored project text is English. Documents were copied to docs, and the root README, AGENTS.md, and MIT LICENSE were written. Since then, CGE-003 through CGE-010 have been implemented; see the [Development Status](STATUS.md).
 
 ## Request for the Next Codex Session
 
@@ -34,6 +34,6 @@ CGE-001 and CGE-002 are complete. The Windows MSVC toolchain and library combina
 
 ## Handoff Status
 
-The planning documents, CGE-001 foundation, and CGE-002 fixtures are complete. Nine tests, the English app and fixture CLI builds, clippy, formatting checks, and Git Scoop window startup verification passed. Full lineage tracking and validation of performance and accuracy targets belong to later stages. No GitHub issues were registered, and no public release was performed.
+The planning documents, CGE-001 foundation, and CGE-002 fixtures are complete. Nine tests, the English app and fixture CLI builds, clippy, formatting checks, and Git Scoop window startup verification passed. Lineage tracking, accuracy validation, and container performance measurements followed; the [Development Status](STATUS.md) lists what remains. No GitHub issues were registered, and no public release was performed.
 
 The referenced conversation [Checking Git Information](chatgpt-conversation://6acda62a-04d8-83ee-b7c8-f93a6dbf3079) was queried, but its previous answer body was returned as a reference marker. Confirmed requirements are based on the current user request and subsequent answers.

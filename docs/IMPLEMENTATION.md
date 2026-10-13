@@ -10,7 +10,7 @@ Initialize a new Git repository; exclude target, local caches, and settings cont
 
 ## Stages and Exit Criteria
 
-Stage 0 and CGE-001 are complete. CGE-002 in stage 1 is also complete: independent fixture oracles, split histories and traps, exact benchmark shape, reproducibility, relative CLI paths, and English text were validated. There are nine passing tests. See the [First Implementation Validation Record](CGE-001.md) and [Ground-truth Validation Record](CGE-002.md). CGE-003 is next; stage 1 still requires production Git-access and syntax work.
+Stage 0 and CGE-001 are complete. CGE-002 in stage 1 is also complete: independent fixture oracles, split histories and traps, exact benchmark shape, reproducibility, relative CLI paths, and English text were validated. There are nine passing tests. See the [First Implementation Validation Record](CGE-001.md) and [Ground-truth Validation Record](CGE-002.md). Stages 1 through 4 have since been implemented and tested; the [Development Status](STATUS.md) records the current verification and the remaining stage 5 work.
 
 | Stage | Implementation result | Completion criteria | Related issues |
 | --- | --- | --- | --- |

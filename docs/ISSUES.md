@@ -26,6 +26,8 @@ Acceptance: specify per-commit observations, expected links/events, and uncertai
 
 P0 · Dependencies: 001, 002
 
+Status: implemented and tested. [Development status](STATUS.md)
+
 Resolve refs to fixed OIDs; query first-parent paths, blobs, changed files, and file-correspondence candidates. Preserve all parent information and distinguish missing objects from shallow boundaries.
 
 Acceptance: handle empty repositories and detached HEAD, and return an unanalyzed state for other merge parents. Do not modify the repository, worktree, index, or refs. Preserve path bytes losslessly. Do not execute external hooks/diffs or make network calls.
@@ -33,6 +35,8 @@ Acceptance: handle empty repositories and detached HEAD, and return an unanalyze
 ## CGE-004 Rust Symbols and Fingerprints
 
 P0 · Dependencies: 001, 002
+
+Status: implemented and tested. All fingerprints come from one traversal per declaration.
 
 Extract functions, impl methods, trait declarations/default implementations, struct/enum/trait, and module/impl context. Distinguish raw, normalized-token, and structural fingerprints, and include grammar/query versions.
 
@@ -42,6 +46,8 @@ Acceptance: fixture names, kinds, context, and byte ranges match ground truth. D
 
 P0 · Dependencies: 001, 003, 004
 
+Status: implemented and tested at schema 4, which interns extractor versions and stores compact symbols.
+
 Separate parse caches from per-commit observations, lineage, and evidence. Implement schema, foreign keys, duplicate-prevention keys, query indexes, version invalidation, and atomic checkpoints.
 
 Acceptance: reruns create no duplicate results; interrupted transactions are not reported as partly complete. Reuse blob caches without mixing observations with different paths or parents. Verify schema/extractor/decision-version changes and cache deletion/regeneration.
@@ -49,6 +55,8 @@ Acceptance: reruns create no duplicate results; interrupted transactions are not
 ## CGE-006 Basic Lineage Links and Events
 
 P0 · Dependencies: 002, 003, 004
+
+Status: implemented and tested. Rule 2 meets the precision, recall, and trap criteria on the CGE-002 validation split.
 
 Compare symbols within the same file and Git-corresponding files, producing multiple events for name/path/signature/body changes. Use parent links rather than dates.
 
@@ -58,6 +66,8 @@ Acceptance: pass ground truth for creation, modification, renaming, and file ren
 
 P0 · Dependencies: 006
 
+Status: implemented and tested. Only pairs that share a name or fingerprint count toward the comparison budget.
+
 Compare unmatched symbols across all changed files to detect partial-file moves and simultaneous name/path changes. Consider candidate margins, context, survival of the original, and possible copies.
 
 Acceptance: link function-move fixtures without arbitrary links for copies, duplicate bodies, or same-name methods. Return candidates and decision evidence. Explicitly mark comparison-limit overflow as unknown. Do not turn splits/merges into confirmed one-to-one links.
@@ -65,6 +75,8 @@ Acceptance: link function-move fixtures without arbitrary links for copies, dupl
 ## CGE-008 Background Analysis, Cancellation, and Resumption
 
 P0 · Dependencies: 005, 006, 007
+
+Status: implemented and tested. A comparison-limit overflow is persisted as unknown scope instead of stopping analysis.
 
 Implement job IDs, bounded queues, cancellation signals, commit-level checkpoints, and version-specific reanalysis. Reuse extraction results for identical blobs.
 
@@ -74,6 +86,8 @@ Acceptance: resumption after cancellation or app exit matches a full run. Ignore
 
 P1 · Dependencies: 004, 008
 
+Status: implemented in code and type-checked. Windows visual QA and UI responsiveness measurement remain.
+
 Build repository selection, ref/commit selection, file/symbol lists, name search, and analysis progress/cancellation/error display.
 
 Acceptance: use real cache/Git data. Show the selected commit and supported/analysis scope. Verify Unicode paths, Windows scaling, Korean font support, and keyboard operation. UI input remains available during analysis.
@@ -82,6 +96,8 @@ Acceptance: use real cache/Git data. Show the selected commit and supported/anal
 
 P1 · Dependencies: 007, 009
 
+Status: implemented in code; trace and source queries are tested. Native UI verification remains.
+
 From timeline selection, navigate to before/after symbols and surrounding source, events, commit/parent/previous-path information, and candidate/evidence panels.
 
 Acceptance: explore earlier source after name/file moves. Distinguish multiple events, first observation, merge introduction, and ambiguity. Do not display similarity scores as probabilities. UI source and commits match stored observations.
@@ -89,6 +105,8 @@ Acceptance: explore earlier source after name/file moves. Distinguish multiple e
 ## CGE-011 Accuracy, Performance, and Offline Validation
 
 P1 · Dependencies: 008, 010
+
+Status: accuracy criteria met. Performance targets were met on the development container only; baseline-PC, UI-latency, and offline-package measurements remain. [Development status](STATUS.md)
 
 Measure accuracy, initial analysis, cached queries, memory, cache, and UI responsiveness on the current development PC using fixed CGE-002 synthetic fixtures. Record actual PC specifications, power mode, build, and measurement conditions. Verify blocked-network operation and unchanged target repositories.
 

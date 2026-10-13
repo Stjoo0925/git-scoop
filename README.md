@@ -19,7 +19,7 @@ Windows 11 x64, Rust 1.99.0 MSVC, Visual Studio C++ x64 build tools, and the Win
 .\scripts\dev.ps1 run
 ```
 
-Enter the path to a local repository containing commits in the app. It reads HEAD source rather than the uncommitted worktree. Caches are stored in LOCALAPPDATA/git-scoop/cache, outside the analyzed repository. Exploring lineage requires completing the next stage, which is still under development.
+Enter the path to a local repository and a local branch, tag, HEAD, or full commit OID in the app. It reads committed source rather than the uncommitted worktree. Caches are stored in LOCALAPPDATA/git-scoop/cache, outside the analyzed repository. Only first-parent history is analyzed.
 
 ## Documents
 

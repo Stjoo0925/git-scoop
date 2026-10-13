@@ -1,7 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod present;
+mod recent;
+mod theme;
+mod view;
+
 use eframe::egui;
 use git_scoop_core::{
+    SymbolKind,
     index::{self, Analysis, Progress},
     store::StoredLocation,
     trace::{self, SourceEvidence, TraceEntry},
@@ -13,14 +19,15 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
-    time::Duration,
 };
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 840.0])
-            .with_min_inner_size([900.0, 650.0]),
+            .with_title("Git Scoop")
+            .with_inner_size([1320.0, 860.0])
+            .with_min_inner_size([960.0, 640.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -28,6 +35,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|context| {
             install_unicode_font(&context.egui_ctx);
+            theme::install(&context.egui_ctx);
             let mut arguments = std::env::args().skip(1);
             let path = arguments.next().unwrap_or_default();
             let revision = arguments.next().unwrap_or_else(|| "HEAD".into());
@@ -63,12 +71,57 @@ struct QueryReply {
     result: Result<QueryView, String>,
 }
 
+/// Symbol groups offered as filters in the explorer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KindFilter {
+    All,
+    Functions,
+    Methods,
+    Types,
+}
+
+impl KindFilter {
+    const ALL: [Self; 4] = [Self::All, Self::Functions, Self::Methods, Self::Types];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Functions => "Functions",
+            Self::Methods => "Methods",
+            Self::Types => "Types",
+        }
+    }
+
+    fn accepts(self, kind: &SymbolKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Functions => matches!(kind, SymbolKind::Function),
+            Self::Methods => matches!(kind, SymbolKind::Method | SymbolKind::TraitMethod),
+            Self::Types => matches!(
+                kind,
+                SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
+            ),
+        }
+    }
+}
+
+/// Views of the selected timeline entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailTab {
+    Code,
+    Changes,
+    Evidence,
+}
+
 struct GitScoop {
     /// Local application data root; caches live outside analyzed repositories.
     cache_root: Option<PathBuf>,
     path: String,
     revision: String,
     search: String,
+    kind_filter: KindFilter,
+    detail_tab: DetailTab,
+    recent: Vec<recent::RecentRepository>,
     loaded: Option<Analysis>,
     error: Option<String>,
     generation: u64,
@@ -77,8 +130,14 @@ struct GitScoop {
     pending: Option<(PathBuf, String)>,
     cancel: Arc<AtomicBool>,
     progress: Option<Progress>,
+    /// When the running analysis started, for the remaining-time estimate.
+    started_at: Option<std::time::Instant>,
     filtered: Vec<(usize, usize)>,
     selected: Option<(usize, usize)>,
+    /// Scroll the symbol list to the selection on the next frame.
+    reveal_selected: bool,
+    /// Symbol list scroll offset and visible height from the last frame.
+    symbol_viewport: (f32, f32),
     query_generation: u64,
     query_receiver: Option<Receiver<QueryReply>>,
     query_cancel: Arc<AtomicBool>,
@@ -108,6 +167,12 @@ fn install_unicode_font(context: &egui::Context) {
     }
 }
 
+impl eframe::App for GitScoop {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
+}
+
 impl GitScoop {
     fn new(
         context: &egui::Context,
@@ -115,11 +180,15 @@ impl GitScoop {
         revision: String,
         cache_root: Option<PathBuf>,
     ) -> Self {
+        let recent = cache_root.as_deref().map(recent::load).unwrap_or_default();
         let mut app = Self {
             cache_root,
             path,
             revision,
             search: String::new(),
+            kind_filter: KindFilter::All,
+            detail_tab: DetailTab::Code,
+            recent,
             loaded: None,
             error: None,
             generation: 0,
@@ -128,8 +197,11 @@ impl GitScoop {
             pending: None,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: None,
+            started_at: None,
             filtered: Vec::new(),
             selected: None,
+            reveal_selected: false,
+            symbol_viewport: (0.0, 0.0),
             query_generation: 0,
             query_receiver: None,
             query_cancel: Arc::new(AtomicBool::new(false)),
@@ -140,6 +212,10 @@ impl GitScoop {
             app.start(context);
         }
         app
+    }
+
+    fn analyzing(&self) -> bool {
+        self.receiver.is_some() || self.pending.is_some()
     }
 
     fn start(&mut self, context: &egui::Context) {
@@ -174,8 +250,32 @@ impl GitScoop {
         self.launch(path, revision, context);
     }
 
+    /// Stop any analysis and return to the start screen.
+    fn close_repository(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.query_cancel.store(true, Ordering::Relaxed);
+        self.generation += 1;
+        self.query_generation += 1;
+        self.pending = None;
+        self.receiver = None;
+        self.query_receiver = None;
+        self.loaded = None;
+        self.progress = None;
+        self.error = None;
+        self.selected = None;
+        self.filtered.clear();
+        self.query = None;
+        self.query_error = None;
+    }
+
+    fn cancel_analysis(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.pending = None;
+    }
+
     fn launch(&mut self, path: PathBuf, revision: String, context: &egui::Context) {
         self.pending = None;
+        self.started_at = Some(std::time::Instant::now());
         let (sender, receiver) = mpsc::sync_channel(4);
         self.receiver = Some(receiver);
         let cancel = self.cancel.clone();
@@ -232,6 +332,7 @@ impl GitScoop {
                     match result {
                         Ok(loaded) => {
                             self.loaded = Some(*loaded);
+                            self.remember_repository();
                             self.refresh_matches();
                         }
                         Err(error) => self.error = Some(error),
@@ -265,18 +366,66 @@ impl GitScoop {
         }
     }
 
+    /// Keep successfully analyzed repositories one click away. The list is a
+    /// convenience, so a failed write leaves analysis results untouched.
+    fn remember_repository(&mut self) {
+        let (Some(root), Some(loaded)) = (&self.cache_root, &self.loaded) else {
+            return;
+        };
+        let _ = recent::remember(
+            root,
+            &mut self.recent,
+            recent::RecentRepository {
+                path: loaded.repository.clone(),
+                revision: self.revision.trim().to_owned(),
+            },
+        );
+    }
+
+    fn forget_repository(&mut self, path: &std::path::Path) {
+        if let Some(root) = &self.cache_root {
+            let _ = recent::forget(root, &mut self.recent, path);
+        }
+    }
+
     fn refresh_matches(&mut self) {
         self.filtered.clear();
-        let search = self.search.to_lowercase();
+        let search = self.search.trim().to_lowercase();
         if let Some(loaded) = &self.loaded {
             for (file_index, file) in loaded.snapshot.files.iter().enumerate() {
                 for (symbol_index, symbol) in file.parsed.symbols.iter().enumerate() {
-                    if symbol.name.to_lowercase().contains(&search) {
+                    if self.kind_filter.accepts(&symbol.kind)
+                        && (search.is_empty() || symbol.name.to_lowercase().contains(&search))
+                    {
                         self.filtered.push((file_index, symbol_index));
                     }
                 }
             }
         }
+    }
+
+    fn select_symbol(&mut self, selected: (usize, usize), context: &egui::Context) {
+        self.selected = Some(selected);
+        self.request_query(selected, None, context);
+    }
+
+    /// Move the symbol selection by `step` rows within the filtered list.
+    fn move_selection(&mut self, step: isize, context: &egui::Context) -> Option<usize> {
+        if self.filtered.is_empty() {
+            return None;
+        }
+        let current = self
+            .selected
+            .and_then(|selected| self.filtered.iter().position(|item| *item == selected));
+        let last = self.filtered.len() - 1;
+        let next = match current {
+            None => 0,
+            Some(index) => index.saturating_add_signed(step).min(last),
+        };
+        if current != Some(next) {
+            self.select_symbol(self.filtered[next], context);
+        }
+        Some(next)
     }
 
     fn request_query(
@@ -358,312 +507,23 @@ impl Drop for GitScoop {
     }
 }
 
-impl eframe::App for GitScoop {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.show(ui);
-    }
-}
-
-impl GitScoop {
-    fn show(&mut self, ui: &mut egui::Ui) {
-        self.poll(ui.ctx());
-        ui.heading("Git Scoop");
-        ui.label("Code Genealogy Explorer · Rust · Local and offline");
-        let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
-        ui.horizontal(|ui| {
-            ui.label("Repository");
-            let path = ui.add(
-                egui::TextEdit::singleline(&mut self.path)
-                    .id(egui::Id::new(PATH_INPUT))
-                    .desired_width(480.0),
-            );
-            ui.label("Ref / commit");
-            let revision = ui.add(
-                egui::TextEdit::singleline(&mut self.revision)
-                    .id(egui::Id::new(REVISION_INPUT))
-                    .desired_width(220.0),
-            );
-            if ui
-                .add_enabled(
-                    !self.path.trim().is_empty() && !self.revision.trim().is_empty(),
-                    egui::Button::new("Analyze / Resume"),
-                )
-                .clicked()
-                || (enter && (path.lost_focus() || revision.lost_focus()))
-            {
-                self.start(ui.ctx());
-            }
-            if (self.receiver.is_some() || self.pending.is_some()) && ui.button("Cancel").clicked()
-            {
-                self.cancel.store(true, Ordering::Relaxed);
-                self.pending = None;
-            }
-        });
-        ui.small("First-parent history only. Other merge parents are recorded but unanalyzed. Macros and conditional compilation are not evaluated.");
-        if self.receiver.is_some() || self.pending.is_some() {
-            ui.spinner();
-            ui.ctx().request_repaint_after(Duration::from_millis(30));
-        }
-        if let Some(progress) = &self.progress {
-            ui.add(
-                egui::ProgressBar::new(progress.completed as f32 / progress.total.max(1) as f32)
-                    .text(format!(
-                        "{} / {} commits · resumed {}",
-                        progress.completed, progress.total, progress.resumed
-                    )),
-            );
-        }
-        if let Some(error) = &self.error {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
-        }
-        let Some(loaded) = &self.loaded else {
-            ui.label("Choose a local Git repository to explore its committed Rust code.");
-            return;
-        };
-        let Some(commit) = &loaded.snapshot.commit_id else {
-            ui.label("This repository has no commits.");
-            return;
-        };
-        ui.label(format!("Fixed commit {commit}"));
-        ui.label(format!(
-            "{} first-parent commits · {} Rust files · {} symbols · {} commits with unknown scope",
-            loaded.history.commits.len(),
-            loaded.snapshot.files.len(),
-            loaded.snapshot.symbol_count(),
-            loaded.unknown_commits
-        ));
-        if loaded.history.boundary != git_scoop_core::git::HistoryBoundary::Root {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                format!(
-                    "Incomplete ancestry: {:?}. Creation cannot be confirmed.",
-                    loaded.history.boundary
-                ),
-            );
-        }
-        for skipped in &loaded.snapshot.skipped {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                format!(
-                    "Skipped {}: {}",
-                    String::from_utf8_lossy(&skipped.path),
-                    skipped.reason
-                ),
-            );
-        }
-        let mut refresh = false;
-        ui.horizontal(|ui| {
-            ui.label("Find symbols");
-            refresh = ui
-                .add(egui::TextEdit::singleline(&mut self.search).id(egui::Id::new(SEARCH_INPUT)))
-                .changed();
-            ui.label(format!("{} matches", self.filtered.len()));
-        });
-        if refresh {
-            self.refresh_matches();
-        }
-        ui.separator();
-        let mut select = None;
-        let mut timeline_row = None;
-        ui.columns(2, |columns| {
-            columns[0].heading("Symbols");
-            if let Some(loaded) = &self.loaded {
-                egui::ScrollArea::vertical()
-                    .id_salt("symbols")
-                    .max_height(210.0)
-                    .show_rows(&mut columns[0], 22.0, self.filtered.len(), |ui, rows| {
-                        for row in rows {
-                            let position = self.filtered[row];
-                            let file = &loaded.snapshot.files[position.0];
-                            let symbol = &file.parsed.symbols[position.1];
-                            let label = format!(
-                                "{} {} · {}:{} · {}",
-                                symbol.kind.label(),
-                                symbol.name,
-                                file.display_path(),
-                                symbol.line,
-                                symbol.context.join("::")
-                            );
-                            if ui
-                                .add(
-                                    egui::Button::selectable(
-                                        self.selected == Some(position),
-                                        label,
-                                    )
-                                    .truncate(),
-                                )
-                                .clicked()
-                            {
-                                select = Some(position);
-                            }
-                        }
-                    });
-            }
-            columns[0].separator();
-            columns[0].heading("Lineage timeline");
-            if self.query_receiver.is_some() {
-                columns[0].spinner();
-                columns[0]
-                    .ctx()
-                    .request_repaint_after(Duration::from_millis(30));
-            }
-            if let Some(error) = &self.query_error {
-                columns[0].colored_label(egui::Color32::LIGHT_RED, error);
-            }
-            if let Some(query) = &self.query {
-                egui::ScrollArea::vertical()
-                    .id_salt("timeline")
-                    .max_height(280.0)
-                    .show_rows(&mut columns[0], 22.0, query.entries.len(), |ui, rows| {
-                        for row in rows {
-                            let entry = &query.entries[row];
-                            let label = format!(
-                                "{} · {} · {}",
-                                entry.name,
-                                entry.events.join(" + "),
-                                &entry.location.commit_id[..entry.location.commit_id.len().min(12)]
-                            );
-                            if ui
-                                .add(
-                                    egui::Button::selectable(query.selected == row, label)
-                                        .truncate(),
-                                )
-                                .clicked()
-                            {
-                                timeline_row = Some(row);
-                            }
-                        }
-                    });
-            } else {
-                columns[0].label("Select a symbol to inspect its history.");
-            }
-            columns[1].heading("Committed source evidence");
-            if let Some(query) = &self.query {
-                let entry = &query.entries[query.selected];
-                columns[1].label(format!("{} · {}", entry.kind, entry.context.join("::")));
-                columns[1].label(entry.message.lines().next().unwrap_or(""));
-                columns[1].label(format!(
-                    "Events: {}",
-                    if entry.events.is_empty() {
-                        "Preserved".into()
-                    } else {
-                        entry.events.join(" + ")
-                    }
-                ));
-                source_panel(&mut columns[1], "After / selected", &query.after, "after");
-                if let Some(before) = &query.before {
-                    source_panel(&mut columns[1], "Earlier observation", before, "before");
-                }
-                if query.before.is_some() {
-                    columns[1].collapsing("Source diff", |ui| match &query.diff {
-                        Ok(lines) => {
-                            egui::ScrollArea::both()
-                                .id_salt("diff")
-                                .max_height(200.0)
-                                .show_rows(ui, 18.0, lines.len(), |ui, rows| {
-                                    for row in rows {
-                                        let line = &lines[row];
-                                        let (prefix, color) = match line.kind {
-                                            trace::DiffKind::Preserved => {
-                                                (" ", egui::Color32::LIGHT_GRAY)
-                                            }
-                                            trace::DiffKind::Removed => {
-                                                ("-", egui::Color32::LIGHT_RED)
-                                            }
-                                            trace::DiffKind::Added => {
-                                                ("+", egui::Color32::LIGHT_GREEN)
-                                            }
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format!("{prefix} {}", line.text))
-                                                .monospace()
-                                                .color(color),
-                                        );
-                                    }
-                                });
-                        }
-                        Err(error) => {
-                            ui.colored_label(egui::Color32::YELLOW, error);
-                        }
-                    });
-                }
-                columns[1].collapsing("Decision evidence", |ui| {
-                    for (index, parent) in entry.parents.iter().enumerate() {
-                        ui.label(format!(
-                            "Parent {}: {}{}",
-                            index + 1,
-                            parent,
-                            if index == 0 {
-                                " · compared"
-                            } else {
-                                " · unanalyzed"
-                            }
-                        ));
-                    }
-                    ui.label(&entry.evidence);
-                    ui.label("Scores describe matching rules; they are not probabilities.");
-                    for candidate in &entry.candidates {
-                        ui.label(format!(
-                            "Candidate: {} · {}",
-                            String::from_utf8_lossy(&candidate.before.path),
-                            candidate.evidence
-                        ));
-                    }
-                });
-            } else {
-                columns[1]
-                    .label("Source comes from immutable Git blobs. Your worktree is not modified.");
-            }
-        });
-        if let Some(selected) = select {
-            self.selected = Some(selected);
-            self.request_query(selected, None, ui.ctx());
-        } else if let (Some(selected), Some(row)) = (self.selected, timeline_row) {
-            self.request_query(selected, Some(row), ui.ctx());
-        }
-    }
-}
-
-fn source_panel(ui: &mut egui::Ui, label: &str, source: &SourceEvidence, salt: &str) {
-    ui.label(format!(
-        "{label}: {} · {} · {}",
-        source.name,
-        String::from_utf8_lossy(&source.location.path),
-        source.location.commit_id
-    ));
-    if source.has_error {
-        ui.colored_label(
-            egui::Color32::YELLOW,
-            "This source has parse errors. Lineage is incomplete.",
-        );
-    }
-    egui::ScrollArea::both()
-        .id_salt(salt)
-        .max_height(180.0)
-        .show_rows(ui, 18.0, source.lines.len(), |ui, rows| {
-            for row in rows {
-                ui.monospace(format!(
-                    "{:>5}  {}",
-                    source.first_line + row,
-                    source.lines[row]
-                ));
-            }
-        });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Context as _;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn key(key: egui::Key) -> egui::Event {
+        key_with(key, egui::Modifiers::NONE)
+    }
+
+    fn key_with(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
         }
     }
 
@@ -727,6 +587,7 @@ mod tests {
         git_scoop_fixtures::generate_suite(&temporary.path().join("suite"))?;
         let repository = temporary.path().join("suite").join("types");
         let context = egui::Context::default();
+        theme::install(&context);
         let mut app = GitScoop::new(
             &context,
             String::new(),
@@ -747,7 +608,16 @@ mod tests {
         })?;
         anyhow::ensure!(app.error.is_none(), "Analysis failed: {:?}", app.error);
 
-        tab_to(&context, &mut app, SEARCH_INPUT)?;
+        frame(
+            &context,
+            &mut app,
+            vec![key_with(egui::Key::F, egui::Modifiers::COMMAND)],
+        );
+        frame(&context, &mut app, Vec::new());
+        anyhow::ensure!(
+            focused(&context, SEARCH_INPUT),
+            "Ctrl+F did not focus search"
+        );
         let name = {
             let loaded = app.loaded.as_ref().context("Loaded analysis")?;
             loaded
@@ -765,9 +635,8 @@ mod tests {
             app.search == name && !app.filtered.is_empty(),
             "Typed search did not filter symbols"
         );
-        // The first symbol row follows the search field in focus order.
-        frame(&context, &mut app, vec![key(egui::Key::Tab)]);
-        frame(&context, &mut app, vec![key(egui::Key::Enter)]);
+        // Arrow keys browse the filtered symbols while search has focus.
+        frame(&context, &mut app, vec![key(egui::Key::ArrowDown)]);
         wait_for(&context, &mut app, |app| {
             app.query.is_some() || app.query_error.is_some()
         })?;
@@ -799,6 +668,7 @@ mod tests {
         let repository = temporary.path().join("benchmark");
         git_scoop_fixtures::generate_benchmark(&repository)?;
         let context = egui::Context::default();
+        theme::install(&context);
         let mut app = GitScoop::new(
             &context,
             repository.display().to_string(),
@@ -824,11 +694,12 @@ mod tests {
         let analysis_seconds = started.elapsed().as_secs_f64();
 
         // Search input after analysis filters all 100,000 declarations.
-        let mut focus_steps = 0;
-        while !focused(&context, SEARCH_INPUT) && focus_steps < 12 {
-            frame(&context, &mut app, vec![key(egui::Key::Tab)]);
-            focus_steps += 1;
-        }
+        frame(
+            &context,
+            &mut app,
+            vec![key_with(egui::Key::F, egui::Modifiers::COMMAND)],
+        );
+        frame(&context, &mut app, Vec::new());
         anyhow::ensure!(focused(&context, SEARCH_INPUT), "Search focus failed");
         let mut search = Vec::new();
         for text in ["f", "_", "0", "1", "2"] {

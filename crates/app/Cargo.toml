@@ -9,6 +9,8 @@ license.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
 git-scoop-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

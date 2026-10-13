@@ -19,7 +19,13 @@ Windows 11 x64, Rust 1.99.0 MSVC, Visual Studio C++ x64 build tools, and the Win
 .\scripts\dev.ps1 run
 ```
 
-Enter the path to a local repository and a local branch, tag, HEAD, or full commit OID in the app. It reads committed source rather than the uncommitted worktree. Caches are stored in LOCALAPPDATA/git-scoop/cache, outside the analyzed repository. Only first-parent history is analyzed.
+Open a repository by entering its folder or dropping the folder onto the window, then choose a local branch, tag, HEAD, or full commit OID. Recently analyzed repositories are listed on the start screen. After analysis:
+
+- Search symbols on the left (Ctrl+F) and filter by functions, methods, or types; Up and Down move through the list.
+- The timeline shows each step newest first, with event badges such as Created, Renamed, Moved file, and Body changed, plus the commit message, author, and date.
+- For the selected step, Code shows the declaration, Changes shows the diff from the previous step, and Why linked lists the matching evidence and any competing candidates.
+
+The app reads committed source rather than the uncommitted worktree. Caches and the recent list are stored in LOCALAPPDATA/git-scoop, outside the analyzed repository. Only first-parent history is analyzed. The interface follows the system light or dark theme and can be switched from the top bar.
 
 ## Documents
 

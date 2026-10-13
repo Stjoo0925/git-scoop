@@ -61,6 +61,10 @@ pub struct CommitMetadata {
     pub parents: Vec<String>,
     pub message: String,
     pub unanalyzed_parents: Vec<String>,
+    /// Author name as recorded, decoded lossily for display.
+    pub author: String,
+    /// Author time in seconds since the Unix epoch; `None` if malformed.
+    pub authored_at: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -226,7 +230,10 @@ pub fn walk_first_parent(path: &Path, commit_id: &str, cancelled: &AtomicBool) -
         let commit = repo.find_commit(id)?;
         let decoded = commit.decode()?;
         let parents: Vec<String> = decoded.parents.iter().map(ToString::to_string).collect();
+        let author = decoded.author()?;
         let record = CommitMetadata {
+            author: author.name.to_string(),
+            authored_at: author.time().ok().map(|time| time.seconds),
             commit_id: id.to_string(),
             tree_id: decoded.tree.to_string(),
             unanalyzed_parents: parents.iter().skip(1).cloned().collect(),
@@ -237,6 +244,7 @@ pub fn walk_first_parent(path: &Path, commit_id: &str, cancelled: &AtomicBool) -
             &mut bytes,
             std::mem::size_of::<CommitMetadata>()
                 + record.message.capacity()
+                + record.author.capacity()
                 + record
                     .parents
                     .iter()

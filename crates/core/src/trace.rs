@@ -17,6 +17,8 @@ pub struct TraceEntry {
     pub kind: String,
     pub context: Vec<String>,
     pub message: String,
+    pub author: String,
+    pub authored_at: Option<i64>,
     pub parents: Vec<String>,
     pub events: Vec<String>,
     pub evidence: String,
@@ -29,6 +31,8 @@ pub struct SourceEvidence {
     pub name: String,
     pub first_line: usize,
     pub lines: Vec<String>,
+    /// One-based lines of the declaration itself, inside the surrounding context.
+    pub symbol_lines: std::ops::RangeInclusive<usize>,
     pub has_error: bool,
 }
 
@@ -109,6 +113,8 @@ pub fn trace(
                 kind: symbol.kind.label().into(),
                 context: symbol.context.clone(),
                 message: metadata.message.clone(),
+                author: metadata.author.clone(),
+                authored_at: metadata.authored_at,
                 parents: metadata.parents.clone(),
                 events,
                 evidence,
@@ -178,6 +184,7 @@ pub fn source(
         name: symbol.name.clone(),
         first_line: start + 1,
         lines,
+        symbol_lines: first + 1..=last + 1,
         has_error: parsed.has_error || symbol.has_error,
     })
 }

@@ -77,6 +77,7 @@ Use "created" only after confirming first appearance along an available complete
 | repositories | Internal repository ID, git/common directory identity, latest ref snapshot |
 | commits / commit_parents | OID, tree, author information, message, ordered parent OIDs |
 | parse_units / extracted_symbols | Blob OID and parser versions; kind, context, ranges, fingerprints, parse quality |
+| extractor_versions | Interned parser, grammar, query, and fingerprint version keys; versioned rows store the short identifier |
 | observations | Repository, commit, original path bytes, extracted-symbol reference |
 | lineage_edges | Before/after observations, compared parent, decision state, rule version |
 | events / match_evidence | Multiple event kinds, score components, alternatives, comparison scope and limits |
@@ -90,7 +91,7 @@ Finalize actual DDL, foreign keys, unique constraints, and query indexes in CGE-
 
 Keep parsing, revwalk, and bulk SQL off the UI thread. An analysis worker owns Git objects, parsers, and the writer, and sends only owned data through a bounded queue. Cancel prior jobs when switching repositories and ignore late responses with a different job ID.
 
-Begin with one bounded analysis worker. Add parallel parsing only after measuring actual bottlenecks. Default limits: 2MiB per blob, 100,000 candidate comparisons per commit pair, 512MiB of app-managed analysis data, and 2GiB per-repository cache including DB and WAL. The memory value is not a hard limit for the entire process; measure its peak separately. Leave exceeded items unknown. Stop jobs at atomic completion boundaries and report cache-limit overflow. Only completed commits qualify as checkpoints, so cancellation or exit can resume to the same result.
+Analysis uses one worker that owns the cache writer and records commits in order. Measurements showed Git reads and parsing were a quarter of initial analysis, so a single reader thread prepares them a bounded distance ahead. The reader never opens the cache database; it parses only blobs absent from the parse cache, and each prepared commit is limited to one-eighth of the analysis budget. A commit that exceeds the comparison budget is recorded as unknown scope, and analysis continues. Default limits: 2MiB per blob, 100,000 candidate comparisons per commit pair, 512MiB of app-managed analysis data, and 2GiB per-repository cache including DB and WAL. The memory value is not a hard limit for the entire process; measure its peak separately. Leave exceeded items unknown. Stop jobs at atomic completion boundaries and report cache-limit overflow. Only completed commits qualify as checkpoints, so cancellation or exit can resume to the same result.
 
 ## Offline Operation and Repository Protection
 

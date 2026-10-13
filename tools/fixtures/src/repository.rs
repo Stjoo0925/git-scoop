@@ -90,7 +90,7 @@ pub(crate) fn check_output(output: Output) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-pub(crate) struct FixtureRepository {
+pub struct FixtureRepository {
     pub root: PathBuf,
     timestamp: u64,
     commit_index: u64,

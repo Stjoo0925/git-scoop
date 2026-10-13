@@ -4,16 +4,20 @@ use crate::{
         self, CommitMetadata, History, HistoryBoundary, RustFile, SkippedFile, Snapshot, TreeFile,
     },
     lineage::{self, IncompleteReason, ObservationId, UnmatchedState},
-    store::{SnapshotStore, StoreCommit, StoredCandidate, StoredEdge, StoredLocation, StoredState},
+    store::{
+        NewParse, SnapshotStore, StoreCommit, StoredCandidate, StoredEdge, StoredLocation,
+        StoredState,
+    },
     syntax::{EXTRACTOR_VERSION, extract_rust},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
 };
 
@@ -87,137 +91,181 @@ pub fn analyze(
         }
         None => 0,
     };
-    let mut previous = if resumed > 0 {
-        Some(
-            snapshot(
-                repository,
+    let common_dir = gix::open(repository)?.common_dir().canonicalize()?;
+    let cached = store.cached_blobs(EXTRACTOR_VERSION)?;
+    let pending = &ordered[resumed.saturating_sub(1)..];
+    // One reader prepares Git reads and parses a bounded distance ahead while
+    // this thread compares and records commits strictly in order.
+    let previous = std::thread::scope(|scope| -> Result<Option<Snapshot>> {
+        let (sender, receiver) = mpsc::sync_channel::<Result<Prepared>>(1);
+        scope.spawn(move || {
+            let mut previous_blobs = HashSet::new();
+            for metadata in pending {
+                let prepared = prepare(repository, metadata, &previous_blobs, &cached, cancelled);
+                let failed = prepared.is_err();
+                if let Ok(prepared) = &prepared {
+                    // Only blobs the writer could load are available for reuse.
+                    previous_blobs = prepared
+                        .files
+                        .iter()
+                        .filter(|file| {
+                            previous_blobs.contains(&file.object_id)
+                                || matches!(
+                                    prepared.blobs.get(&file.object_id),
+                                    Some(Loaded::Parsed(..) | Loaded::Cached(_))
+                                )
+                        })
+                        .map(|file| file.object_id.clone())
+                        .collect();
+                }
+                if sender.send(prepared).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        let next = || {
+            receiver
+                .recv()
+                .context("The analysis reader stopped unexpectedly.")?
+        };
+        // A resumed baseline normally hits the parse cache. Any parse it had to
+        // recompute is persisted with the next commit, whose edges reference it.
+        let mut pending_parses = Vec::new();
+        let mut previous = if resumed > 0 {
+            let (baseline, _, parses) = assemble(
+                next()?,
                 ordered[resumed - 1],
-                &mut store,
+                &common_dir,
+                &store,
                 None,
                 &history.boundary,
                 cancelled,
-            )?
-            .0,
-        )
-    } else {
-        None
-    };
-    for (index, metadata) in ordered.iter().enumerate().skip(resumed) {
-        check_cancelled(cancelled)?;
-        let (current, files) = snapshot(
-            repository,
-            metadata,
-            &mut store,
-            previous.as_ref(),
-            &history.boundary,
-            cancelled,
-        )?;
-        let mut request = StoreCommit {
-            target_id: target.clone(),
-            metadata: (*metadata).clone(),
-            files,
-            edges: Vec::new(),
-            candidates: Vec::new(),
-            states: Vec::new(),
-            rule_version: rule.clone(),
-            extractor_version: EXTRACTOR_VERSION,
-        };
-        if let Some(before) = &previous {
-            let pair = lineage::compare_snapshots(before, &current, cancelled)?;
-            ensure!(
-                !pair.incomplete.contains(&IncompleteReason::Cancelled),
-                "Analysis was cancelled."
-            );
-            ensure!(
-                !pair.incomplete.contains(&IncompleteReason::ComparisonLimit),
-                "The 100,000 comparison limit was reached at {}. Unexamined lineage is unknown; this commit has no completion checkpoint.",
-                metadata.commit_id
-            );
-            for item in &pair.links {
-                request.edges.push(StoredEdge { before: location(before, item.before)?, after: location(&current, item.after)?, events: item.events.iter().map(|event| format!("{event:?}")).collect(), evidence: serde_json::to_string(&serde_json::json!({"same_path":item.evidence.same_path,"same_name":item.evidence.same_name,"same_context":item.evidence.same_context,"same_signature":item.evidence.same_signature,"same_body":item.evidence.same_body,"same_tokens":item.evidence.same_tokens,"same_structure":item.evidence.same_structure,"score":item.evidence.score,"compared_parent": before.commit_id,"rule":pair.rule_version}))? });
-            }
-            for item in &pair.candidates {
-                request.candidates.push(StoredCandidate {
-                    before: location(before, item.before)?,
-                    after: location(&current, item.after)?,
-                    evidence: format!(
-                        "{:?}; {:?}; rule {}",
-                        item.kind, item.evidence, pair.rule_version
-                    ),
-                });
-            }
-            for item in &pair.before_unmatched {
-                request.states.push(StoredState {
-                    location: Some(location(before, item.observation)?),
-                    kind: match item.state {
-                        UnmatchedState::Deleted => "Deleted",
-                        UnmatchedState::Ambiguous => "Ambiguous",
-                        _ => "Unknown",
-                    }
-                    .into(),
-                    evidence: "Compared with the next first-parent snapshot.".into(),
-                });
-            }
-            for item in &pair.after_unmatched {
-                let kind = match item.state {
-                    UnmatchedState::Added if metadata.parents.len() > 1 => "MergeImported",
-                    UnmatchedState::Added => "Created",
-                    UnmatchedState::Ambiguous => "Ambiguous",
-                    _ => "Unknown",
-                };
-                request.states.push(StoredState { location: Some(location(&current, item.observation)?), kind: kind.into(), evidence: "Other merge parents, macro expansion, and type resolution are not analyzed.".into() });
-            }
-            for reason in &pair.incomplete {
-                request.states.push(StoredState {
-                    location: None,
-                    kind: "Incomplete".into(),
-                    evidence: format!("{reason:?}"),
-                });
-            }
+            )?;
+            pending_parses = parses;
+            Some(baseline)
         } else {
-            let complete_root =
-                metadata.parents.is_empty() && history.boundary == HistoryBoundary::Root;
-            for (file_index, file) in current.files.iter().enumerate() {
-                for symbol_index in 0..file.parsed.symbols.len() {
-                    let kind = if file.parsed.has_error {
-                        "Unknown"
-                    } else if complete_root {
-                        "Created"
-                    } else {
-                        "FirstObserved"
-                    };
-                    request.states.push(StoredState {
-                        location: Some(location(
-                            &current,
-                            ObservationId {
-                                file_index,
-                                symbol_index,
-                            },
-                        )?),
-                        kind: kind.into(),
-                        evidence: format!("Baseline boundary: {:?}", history.boundary),
+            None
+        };
+        for (index, metadata) in ordered.iter().enumerate().skip(resumed) {
+            check_cancelled(cancelled)?;
+            let (current, files, mut parses) = assemble(
+                next()?,
+                metadata,
+                &common_dir,
+                &store,
+                previous.as_ref(),
+                &history.boundary,
+                cancelled,
+            )?;
+            parses.append(&mut pending_parses);
+            let mut request = StoreCommit {
+                target_id: target.clone(),
+                parses,
+                metadata: (*metadata).clone(),
+                files,
+                edges: Vec::new(),
+                candidates: Vec::new(),
+                states: Vec::new(),
+                rule_version: rule.clone(),
+                extractor_version: EXTRACTOR_VERSION,
+            };
+            if let Some(before) = &previous {
+                let pair = lineage::compare_snapshots(before, &current, cancelled)?;
+                ensure!(
+                    !pair.incomplete.contains(&IncompleteReason::Cancelled),
+                    "Analysis was cancelled."
+                );
+                // A comparison-limit overflow is persisted like a parse error: the
+                // pair keeps an Incomplete state and its unexamined observations
+                // stay Unknown, so later commits remain analyzable without
+                // reporting the overflow as deletion, creation, or full analysis.
+                for item in &pair.links {
+                    request.edges.push(StoredEdge { before: location(before, item.before)?, after: location(&current, item.after)?, events: item.events.iter().map(|event| format!("{event:?}")).collect(), evidence: serde_json::to_string(&serde_json::json!({"same_path":item.evidence.same_path,"same_name":item.evidence.same_name,"same_context":item.evidence.same_context,"same_signature":item.evidence.same_signature,"same_body":item.evidence.same_body,"same_tokens":item.evidence.same_tokens,"same_structure":item.evidence.same_structure,"score":item.evidence.score,"compared_parent": before.commit_id,"rule":pair.rule_version}))? });
+                }
+                for item in &pair.candidates {
+                    request.candidates.push(StoredCandidate {
+                        before: location(before, item.before)?,
+                        after: location(&current, item.after)?,
+                        evidence: format!(
+                            "{:?}; {:?}; rule {}",
+                            item.kind, item.evidence, pair.rule_version
+                        ),
                     });
                 }
+                for item in &pair.before_unmatched {
+                    request.states.push(StoredState {
+                        location: Some(location(before, item.observation)?),
+                        kind: match item.state {
+                            UnmatchedState::Deleted => "Deleted",
+                            UnmatchedState::Ambiguous => "Ambiguous",
+                            _ => "Unknown",
+                        }
+                        .into(),
+                        evidence: "Compared with the next first-parent snapshot.".into(),
+                    });
+                }
+                for item in &pair.after_unmatched {
+                    let kind = match item.state {
+                        UnmatchedState::Added if metadata.parents.len() > 1 => "MergeImported",
+                        UnmatchedState::Added => "Created",
+                        UnmatchedState::Ambiguous => "Ambiguous",
+                        _ => "Unknown",
+                    };
+                    request.states.push(StoredState { location: Some(location(&current, item.observation)?), kind: kind.into(), evidence: "Other merge parents, macro expansion, and type resolution are not analyzed.".into() });
+                }
+                for reason in &pair.incomplete {
+                    request.states.push(StoredState {
+                        location: None,
+                        kind: "Incomplete".into(),
+                        evidence: format!("{reason:?}"),
+                    });
+                }
+            } else {
+                let complete_root =
+                    metadata.parents.is_empty() && history.boundary == HistoryBoundary::Root;
+                for (file_index, file) in current.files.iter().enumerate() {
+                    for symbol_index in 0..file.parsed.symbols.len() {
+                        let kind = if file.parsed.has_error {
+                            "Unknown"
+                        } else if complete_root {
+                            "Created"
+                        } else {
+                            "FirstObserved"
+                        };
+                        request.states.push(StoredState {
+                            location: Some(location(
+                                &current,
+                                ObservationId {
+                                    file_index,
+                                    symbol_index,
+                                },
+                            )?),
+                            kind: kind.into(),
+                            evidence: format!("Baseline boundary: {:?}", history.boundary),
+                        });
+                    }
+                }
             }
-        }
-        for file in &current.skipped {
-            request.states.push(StoredState {
-                location: None,
-                kind: "SkippedFile".into(),
-                evidence: format!("{}: {}", String::from_utf8_lossy(&file.path), file.reason),
+            for file in &current.skipped {
+                request.states.push(StoredState {
+                    location: None,
+                    kind: "SkippedFile".into(),
+                    evidence: format!("{}: {}", String::from_utf8_lossy(&file.path), file.reason),
+                });
+            }
+            check_cancelled(cancelled)?;
+            store.record_commit(&request, cancelled)?;
+            progress(Progress {
+                target_id: target.clone(),
+                commit_id: metadata.commit_id.clone(),
+                completed: index + 1,
+                total: ordered.len(),
+                resumed,
             });
+            previous = Some(current);
         }
-        check_cancelled(cancelled)?;
-        store.record_commit(&request, cancelled)?;
-        progress(Progress {
-            target_id: target.clone(),
-            commit_id: metadata.commit_id.clone(),
-            completed: index + 1,
-            total: ordered.len(),
-            resumed,
-        });
-        previous = Some(current);
-    }
+        Ok(previous)
+    })?;
     let unknown_commits = store.unknown_commit_count(&target, &rule, EXTRACTOR_VERSION)?;
     let snapshot = previous.context("The selected history contains no available commits.")?;
     Ok(Analysis {
@@ -230,18 +278,86 @@ pub fn analyze(
     })
 }
 
-fn snapshot(
+/// Git reads and parses for one commit, prepared ahead of the writer.
+struct Prepared {
+    files: Vec<TreeFile>,
+    /// Blobs absent from the preceding commit, each loaded once.
+    blobs: BTreeMap<String, Loaded>,
+}
+
+enum Loaded {
+    Parsed(Arc<str>, Arc<ParsedRust>),
+    /// The parse cache already holds this blob; the writer loads it.
+    Cached(Arc<str>),
+    Unreadable(String),
+}
+
+/// Bytes newly owned by one prepared commit; at most two are outstanding.
+const PREPARED_BUDGET_BYTES: usize = ANALYSIS_BUDGET_BYTES / 8;
+/// Each of the two live snapshots; with two prepared commits this stays
+/// within the analysis budget.
+const SNAPSHOT_BUDGET_BYTES: usize = ANALYSIS_BUDGET_BYTES * 3 / 8;
+
+/// Read and parse blobs that the preceding commit did not contain. This runs
+/// on the reader thread and never touches the cache database, so it cannot
+/// hold a reader that blocks the writer's WAL checkpoints.
+fn prepare(
     repository: &Path,
     metadata: &CommitMetadata,
-    store: &mut SnapshotStore,
+    previous_blobs: &HashSet<String>,
+    cached: &HashSet<String>,
+    cancelled: &AtomicBool,
+) -> Result<Prepared> {
+    let files = git::list_rust_files(repository, &metadata.commit_id, cancelled)?;
+    let mut blobs = BTreeMap::new();
+    let mut bytes = 0usize;
+    for file in &files {
+        check_cancelled(cancelled)?;
+        if previous_blobs.contains(&file.object_id) || blobs.contains_key(&file.object_id) {
+            continue;
+        }
+        let loaded = match git::read_blob(repository, &file.object_id, cancelled) {
+            Ok(source) => {
+                let source: Arc<str> = Arc::from(source);
+                bytes = bytes
+                    .checked_add(source.len())
+                    .context("Analysis memory size overflow.")?;
+                if cached.contains(&file.object_id) {
+                    Loaded::Cached(source)
+                } else {
+                    let parsed = Arc::new(extract_rust(&source)?);
+                    bytes = bytes
+                        .checked_add(parsed.owned_bytes())
+                        .context("Analysis memory size overflow.")?;
+                    Loaded::Parsed(source, parsed)
+                }
+            }
+            Err(error) if cancelled.load(Ordering::Relaxed) => return Err(error),
+            Err(error) => Loaded::Unreadable(format!("{error:#}")),
+        };
+        ensure!(
+            bytes <= PREPARED_BUDGET_BYTES,
+            "A prepared commit exceeded its share of the 512 MiB analysis budget; analysis is incomplete."
+        );
+        blobs.insert(file.object_id.clone(), loaded);
+    }
+    Ok(Prepared { files, blobs })
+}
+
+/// Build the commit snapshot on the writer thread, sharing sources and parse
+/// results with the preceding snapshot and loading cached parses.
+fn assemble(
+    prepared: Prepared,
+    metadata: &CommitMetadata,
+    common_dir: &Path,
+    store: &SnapshotStore,
     previous: Option<&Snapshot>,
     boundary: &HistoryBoundary,
     cancelled: &AtomicBool,
-) -> Result<(Snapshot, Vec<TreeFile>)> {
-    let files = git::list_rust_files(repository, &metadata.commit_id, cancelled)?;
-    let common_dir = gix::open(repository)?.common_dir().canonicalize()?;
+) -> Result<(Snapshot, Vec<TreeFile>, Vec<NewParse>)> {
+    let Prepared { files, mut blobs } = prepared;
     let mut result = Snapshot {
-        common_dir,
+        common_dir: common_dir.to_owned(),
         commit_id: Some(metadata.commit_id.clone()),
         parents: metadata.parents.clone(),
         message: metadata.message.clone(),
@@ -264,89 +380,76 @@ fn snapshot(
             reused.insert(&file.blob_id, file);
         }
     }
+    // Blobs first seen in this commit; copies within the commit share them.
+    let mut loaded_here: BTreeMap<String, (Arc<str>, Arc<ParsedRust>)> = BTreeMap::new();
+    let mut new_parses = Vec::new();
     let mut bytes = files
         .iter()
         .map(|f| f.path.capacity() + f.object_id.capacity() + std::mem::size_of::<TreeFile>())
         .sum::<usize>();
     for file in &files {
         check_cancelled(cancelled)?;
-        let loaded = if let Some(old) = reused.get(file.object_id.as_str()) {
-            RustFile {
-                path: file.path.clone(),
-                blob_id: file.object_id.clone(),
-                source: old.source.clone(),
-                parsed: old.parsed.clone(),
-            }
+        let (source, parsed) = if let Some(old) = reused.get(file.object_id.as_str()) {
+            (old.source.clone(), old.parsed.clone())
+        } else if let Some((source, parsed)) = loaded_here.get(&file.object_id) {
+            (source.clone(), parsed.clone())
         } else {
-            let source = match git::read_blob(repository, &file.object_id, cancelled) {
-                Ok(source) => source,
-                Err(error) if cancelled.load(Ordering::Relaxed) => return Err(error),
-                Err(error) => {
+            let (source, parsed) = match blobs.remove(&file.object_id) {
+                Some(Loaded::Parsed(source, parsed)) => {
+                    new_parses.push((file.object_id.clone(), parsed.clone()));
+                    (source, parsed)
+                }
+                Some(Loaded::Cached(source)) => {
+                    let parsed = match store.load_parse(&file.object_id, EXTRACTOR_VERSION)? {
+                        Some(parsed) => Arc::new(parsed),
+                        None => {
+                            let parsed = Arc::new(extract_rust(&source)?);
+                            new_parses.push((file.object_id.clone(), parsed.clone()));
+                            parsed
+                        }
+                    };
+                    (source, parsed)
+                }
+                Some(Loaded::Unreadable(reason)) => {
+                    // Keep the reason for other paths sharing this blob.
+                    blobs.insert(file.object_id.clone(), Loaded::Unreadable(reason.clone()));
                     result.skipped.push(SkippedFile {
                         path: file.path.clone(),
-                        reason: format!("{error:#}"),
+                        reason,
                     });
                     continue;
                 }
+                None => anyhow::bail!(
+                    "The prepared commit is missing blob {}; analysis is incomplete.",
+                    file.object_id
+                ),
             };
-            let parsed = match store.load_parse(&file.object_id, EXTRACTOR_VERSION)? {
-                Some(parsed) => parsed,
-                None => {
-                    let parsed = extract_rust(&source)?;
-                    check_cancelled(cancelled)?;
-                    store.save_parse(&file.object_id, &parsed)?;
-                    parsed
-                }
-            };
-            RustFile {
-                path: file.path.clone(),
-                blob_id: file.object_id.clone(),
-                source: Arc::from(source),
-                parsed: Arc::new(parsed),
-            }
+            loaded_here.insert(file.object_id.clone(), (source.clone(), parsed.clone()));
+            (source, parsed)
+        };
+        let loaded = RustFile {
+            path: file.path.clone(),
+            blob_id: file.object_id.clone(),
+            source,
+            parsed,
         };
         // Count shared units conservatively once per file; transient before/after
         // snapshots share their large buffers and do not duplicate their bodies.
         bytes = bytes
             .checked_add(
                 loaded.source.len()
-                    + parsed_size(&loaded.parsed)
+                    + loaded.parsed.owned_bytes()
                     + loaded.path.capacity()
                     + loaded.blob_id.capacity(),
             )
             .context("Analysis memory size overflow.")?;
         ensure!(
-            bytes <= ANALYSIS_BUDGET_BYTES / 2,
+            bytes <= SNAPSHOT_BUDGET_BYTES,
             "The current snapshot exceeded its share of the 512 MiB analysis budget; analysis is incomplete."
         );
         result.files.push(loaded);
     }
-    Ok((result, files))
-}
-
-fn parsed_size(parsed: &ParsedRust) -> usize {
-    parsed.symbols.capacity() * std::mem::size_of::<crate::Symbol>()
-        + parsed
-            .symbols
-            .iter()
-            .map(|s| {
-                s.name.capacity()
-                    + s.context.capacity() * std::mem::size_of::<String>()
-                    + s.context.iter().map(String::capacity).sum::<usize>()
-            })
-            .sum::<usize>()
-        + parsed.diagnostics.capacity() * std::mem::size_of::<crate::ParseDiagnostic>()
-        + parsed
-            .diagnostics
-            .iter()
-            .map(|d| d.syntax_kind.capacity())
-            .sum::<usize>()
-        + parsed.unsupported.capacity() * std::mem::size_of::<crate::UnsupportedSyntax>()
-        + parsed
-            .unsupported
-            .iter()
-            .map(|d| d.syntax_kind.capacity())
-            .sum::<usize>()
+    Ok((result, files, new_parses))
 }
 
 fn location(snapshot: &Snapshot, id: ObservationId) -> Result<StoredLocation> {

@@ -271,6 +271,37 @@ fn unchanged_blobs_use_file_correspondence_without_candidate_budget() -> Result<
 }
 
 #[test]
+fn renaming_in_a_large_tree_compares_only_related_symbols() -> Result<()> {
+    // 100,000 declarations in unchanged files would exhaust the pair budget if
+    // one unmatched symbol were compared with every observation in the tree.
+    let source = (0..500)
+        .map(|i| format!("fn keep_{i}() -> u64 {{ {i} }}\n"))
+        .collect::<String>();
+    let unchanged = synthetic(&source, b"unchanged.rs")?.files.remove(0);
+    let mut before = synthetic("fn run(x: u32) -> u32 { x + 7 }", b"lib.rs")?;
+    let mut after = synthetic("fn execute(x: u32) -> u32 { x + 7 }", b"lib.rs")?;
+    for index in 0..200 {
+        let file = git::RustFile {
+            path: format!("unchanged_{index:03}.rs").into_bytes(),
+            blob_id: "immutable blob".into(),
+            ..unchanged.clone()
+        };
+        before.files.push(file.clone());
+        after.files.push(file);
+    }
+    let result = lineage::compare_snapshots(&before, &after, &AtomicBool::new(false))?;
+    ensure!(
+        result.incomplete.is_empty()
+            && result.preserved_files.len() == 200
+            && result.links.len() == 1
+            && result.links[0].events == vec![Event::Renamed]
+            && result.comparisons < 10,
+        "Unrelated unchanged symbols consumed the comparison budget"
+    );
+    Ok(())
+}
+
+#[test]
 fn comparisons_reject_other_merge_parents() -> Result<()> {
     let mut before = synthetic("fn run() {}", b"lib.rs")?;
     let mut after = synthetic("fn run() {}", b"lib.rs")?;

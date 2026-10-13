@@ -3,6 +3,7 @@
 
 use crate::{
     DetailTab, GitScoop, KindFilter, PATH_INPUT, QueryView, REVISION_INPUT, SEARCH_INPUT,
+    highlight,
     present::{self, Tone},
     theme::{self, ACCENT, Palette},
 };
@@ -782,11 +783,43 @@ fn timeline(ui: &mut egui::Ui, query: &QueryView) -> Option<usize> {
         .id_salt("timeline")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let last = query.entries.len().saturating_sub(1);
             for (row, entry) in query.entries.iter().enumerate() {
-                if timeline_step(ui, entry, row == query.selected, now).clicked() {
+                let response = ui
+                    .horizontal(|ui| {
+                        // The gutter holds the connecting line and step marker.
+                        ui.add_space(GUTTER);
+                        timeline_step(ui, entry, row == query.selected, now)
+                    })
+                    .inner;
+                let rect = response.rect;
+                let x = rect.left() - GUTTER / 2.0 - 2.0;
+                let marker = egui::pos2(x, rect.top() + 24.0);
+                if row < last {
+                    ui.painter().line_segment(
+                        [marker, egui::pos2(x, rect.bottom() + 12.0 + 24.0)],
+                        Stroke::new(2.0, palette.border()),
+                    );
+                }
+                let tone = entry
+                    .events
+                    .first()
+                    .map(|kind| present::event_label(kind).1)
+                    .unwrap_or(Tone::Quiet);
+                ui.painter().circle_filled(marker, 6.0, palette.tone(tone));
+                ui.painter()
+                    .circle_stroke(marker, 6.0, Stroke::new(2.0, ui.visuals().panel_fill));
+                if response.clicked() {
                     clicked = Some(row);
                 }
-                ui.add_space(4.0);
+                let commit = entry.location.commit_id.clone();
+                response.context_menu(|ui| {
+                    if ui.button("Copy commit ID").clicked() {
+                        ui.ctx().copy_text(commit.clone());
+                        ui.close();
+                    }
+                });
+                ui.add_space(6.0);
             }
             if let Some(oldest) = query.entries.last()
                 && !oldest.events.iter().any(|event| event == "Created")
@@ -804,6 +837,8 @@ fn timeline(ui: &mut egui::Ui, query: &QueryView) -> Option<usize> {
     clicked
 }
 
+const GUTTER: f32 = 22.0;
+
 fn timeline_step(
     ui: &mut egui::Ui,
     entry: &TraceEntry,
@@ -811,11 +846,6 @@ fn timeline_step(
     now: i64,
 ) -> egui::Response {
     let palette = Palette::of(ui);
-    let tone = entry
-        .events
-        .first()
-        .map(|kind| present::event_label(kind).1)
-        .unwrap_or(Tone::Quiet);
     let frame = egui::Frame::new()
         .fill(if selected {
             palette.selected()
@@ -830,64 +860,65 @@ fn timeline_step(
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(dot.center(), 5.0, palette.tone(tone));
-                ui.horizontal_wrapped(|ui| {
-                    if entry.events.is_empty() {
-                        theme::badge(ui, "Unchanged", palette.tone(Tone::Quiet))
-                            .on_hover_text(present::event_hint("Unchanged"));
-                    }
-                    for kind in &entry.events {
-                        let (label, tone) = present::event_label(kind);
-                        let hint = present::event_hint(kind);
-                        let badge = theme::badge(ui, label, palette.tone(tone));
-                        if !hint.is_empty() {
-                            badge.on_hover_text(hint);
+            // The step sits in a horizontal row beside its gutter.
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if entry.events.is_empty() {
+                            theme::badge(ui, "Unchanged", palette.tone(Tone::Quiet))
+                                .on_hover_text(present::event_hint("Unchanged"));
                         }
-                    }
+                        for kind in &entry.events {
+                            let (label, tone) = present::event_label(kind);
+                            let hint = present::event_hint(kind);
+                            let badge = theme::badge(ui, label, palette.tone(tone));
+                            if !hint.is_empty() {
+                                badge.on_hover_text(hint);
+                            }
+                        }
+                    });
                 });
-            });
-            let message = present::first_line(&entry.message);
-            ui.label(
-                RichText::new(if message.is_empty() {
-                    "(no message)"
-                } else {
-                    message
-                })
-                .color(palette.strong()),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "{} · {} · {}",
-                    if entry.author.is_empty() {
-                        "unknown author"
+                let message = present::first_line(&entry.message);
+                ui.label(
+                    RichText::new(if message.is_empty() {
+                        "(no message)"
                     } else {
-                        &entry.author
-                    },
-                    present::when(entry.authored_at, now),
-                    present::short_id(&entry.location.commit_id)
-                ))
-                .small()
-                .color(palette.muted()),
-            );
-            // Name and file per step make renames and moves visible at a glance.
-            ui.label(
-                RichText::new(format!(
-                    "{} in {}",
-                    entry.name,
-                    String::from_utf8_lossy(&entry.location.path)
-                ))
-                .small()
-                .color(palette.muted()),
-            );
+                        message
+                    })
+                    .color(palette.strong()),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} · {}",
+                        if entry.author.is_empty() {
+                            "unknown author"
+                        } else {
+                            &entry.author
+                        },
+                        present::when(entry.authored_at, now),
+                        present::short_id(&entry.location.commit_id)
+                    ))
+                    .small()
+                    .color(palette.muted()),
+                );
+                // Name and file per step make renames and moves visible at a glance.
+                ui.label(
+                    RichText::new(format!(
+                        "{} in {}",
+                        entry.name,
+                        String::from_utf8_lossy(&entry.location.path)
+                    ))
+                    .small()
+                    .color(palette.muted()),
+                );
+            });
         });
     ui.interact(
         frame.response.rect,
         frame.response.id.with("step"),
         Sense::click(),
     )
+    .on_hover_text("Click to inspect · right-click to copy the commit ID")
 }
 
 fn detail(ui: &mut egui::Ui, query: &QueryView, tab: &mut DetailTab) {
@@ -954,6 +985,37 @@ fn source_header(ui: &mut egui::Ui, source: &SourceEvidence) {
     }
 }
 
+/// One source line as a colored text layout.
+fn highlighted(
+    text: &str,
+    state: &mut highlight::State,
+    palette: Palette,
+    font: &FontId,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for (range, token) in highlight::line(text, state) {
+        job.append(
+            &text[range],
+            0.0,
+            egui::TextFormat::simple(font.clone(), palette.syntax(token)),
+        );
+    }
+    job
+}
+
+/// Tokenizer state at the start of each line, so visible rows can be colored
+/// without rendering the rows above them.
+fn line_states<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<highlight::State> {
+    let mut state = highlight::State::default();
+    lines
+        .map(|line| {
+            let start = state;
+            highlight::line(line, &mut state);
+            start
+        })
+        .collect()
+}
+
 fn code_view(ui: &mut egui::Ui, source: &SourceEvidence, salt: &str) {
     let palette = Palette::of(ui);
     let font = FontId::monospace(13.0);
@@ -964,6 +1026,7 @@ fn code_view(ui: &mut egui::Ui, source: &SourceEvidence, salt: &str) {
         .max()
         .unwrap_or(0);
     let char_width = ui.fonts_mut(|fonts| fonts.glyph_width(&font, 'm'));
+    let states = line_states(source.lines.iter().map(String::as_str));
     egui::Frame::new()
         .fill(palette.code_background())
         .corner_radius(6)
@@ -991,11 +1054,17 @@ fn code_view(ui: &mut egui::Ui, source: &SourceEvidence, salt: &str) {
                             font.clone(),
                             palette.muted(),
                         );
-                        painter.text(
-                            rect.left_center() + egui::vec2(56.0, 0.0),
-                            Align2::LEFT_CENTER,
+                        let mut state = states[row];
+                        let galley = painter.layout_job(highlighted(
                             &source.lines[row],
-                            font.clone(),
+                            &mut state,
+                            palette,
+                            &font,
+                        ));
+                        let top = rect.center().y - galley.size().y / 2.0;
+                        painter.galley(
+                            egui::pos2(rect.left() + 56.0, top),
+                            galley,
                             palette.strong(),
                         );
                     }
@@ -1012,6 +1081,7 @@ fn diff_view(ui: &mut egui::Ui, lines: &[git_scoop_core::trace::DiffLine]) {
         .max()
         .unwrap_or(0);
     let char_width = ui.fonts_mut(|fonts| fonts.glyph_width(&font, 'm'));
+    let states = line_states(lines.iter().map(|line| line.text.as_str()));
     egui::Frame::new()
         .fill(palette.code_background())
         .corner_radius(6)
@@ -1048,11 +1118,13 @@ fn diff_view(ui: &mut egui::Ui, lines: &[git_scoop_core::trace::DiffLine]) {
                             font.clone(),
                             color,
                         );
-                        painter.text(
-                            rect.left_center() + egui::vec2(24.0, 0.0),
-                            Align2::LEFT_CENTER,
-                            &line.text,
-                            font.clone(),
+                        let mut state = states[row];
+                        let galley =
+                            painter.layout_job(highlighted(&line.text, &mut state, palette, &font));
+                        let top = rect.center().y - galley.size().y / 2.0;
+                        painter.galley(
+                            egui::pos2(rect.left() + 24.0, top),
+                            galley,
                             palette.strong(),
                         );
                     }

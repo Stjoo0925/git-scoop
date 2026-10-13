@@ -1,6 +1,6 @@
 //! Typography, spacing, and colors for both light and dark themes.
 
-use crate::present::Tone;
+use crate::{highlight::Token, present::Tone};
 use eframe::egui::{
     self, Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, TextStyle, Theme, Visuals,
 };
@@ -90,6 +90,23 @@ impl Palette {
         } else {
             Color32::from_rgb(0xFD, 0xEB, 0xEC)
         }
+    }
+
+    /// Code token colors tuned for each theme's code background.
+    pub fn syntax(self, token: Token) -> Color32 {
+        let (dark, light) = match token {
+            Token::Plain => return self.strong(),
+            Token::Keyword => ((0xC6, 0x78, 0xDD), (0x8B, 0x2F, 0xC9)),
+            Token::Type => ((0xE5, 0xC0, 0x7B), (0x98, 0x68, 0x01)),
+            Token::Function => ((0x61, 0xAF, 0xEF), (0x1F, 0x5F, 0xBF)),
+            Token::Macro => ((0x56, 0xB6, 0xC2), (0x0E, 0x7C, 0x86)),
+            Token::String => ((0x98, 0xC3, 0x79), (0x3A, 0x7D, 0x2A)),
+            Token::Number => ((0xD1, 0x9A, 0x66), (0xB0, 0x52, 0x10)),
+            Token::Comment => ((0x7F, 0x84, 0x8E), (0x6A, 0x73, 0x7D)),
+            Token::Lifetime => ((0xE0, 0x6C, 0x75), (0xC0, 0x25, 0x2D)),
+        };
+        let (r, g, b) = if self.dark { dark } else { light };
+        Color32::from_rgb(r, g, b)
     }
 
     /// Foreground color for an event category, readable in both themes.

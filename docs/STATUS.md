@@ -64,9 +64,9 @@ The query boundary is the harness's: trace plus the selected and earlier source 
 
 `fixtures/oracle-v1.json` matches the current suite generator byte for byte. `fixtures/benchmark-v2.json` and `docs/CGE-002-benchmark.json` record the current benchmark generator output; the version 1 record was retired with the generator change.
 
-## Remaining Work
+## Release Checks Before Publication
 
-No development task remains outside packaging. The open items are confirmations on the user's baseline Windows PC, which DECISIONS.md fixes as the release measurement machine. The cloud development environments are Linux only, so these cannot run here, and they need no code changes unless a measurement fails.
+Development is complete except packaging (CGE-012). The checks below are release validation on the user's baseline Windows PC, which DECISIONS.md fixes as the release measurement machine. They have not been performed: the cloud development environments are Linux only. Run them with CGE-012's install verification on the same PC. They need no code changes unless a measurement fails.
 
 - **Baseline PC measurements:** Repeat the performance measurements on the baseline Windows PC with a static-CRT release build, and record power mode and peak memory. Container results do not establish the release targets. From an x64 Visual Studio developer PowerShell in the project root, run the harness as follows, with new destination and cache paths each time:
 

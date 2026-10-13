@@ -933,6 +933,8 @@ dependencies = [
  "anyhow",
  "eframe",
  "git-scoop-core",
+ "git-scoop-fixtures",
+ "tempfile",
 ]
 
 [[package]]

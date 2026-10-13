@@ -11,10 +11,10 @@ This record reconciles the issue backlog with the code as of October 13, 2026. E
 | CGE-005 SQLite model and migrations | `crates/core/src/store.rs` (schema 4) | `tests/store.rs`: atomic checkpoints, migrations from schemas 1 and 2, foreign keys, cache budget, compact symbols, query plans |
 | CGE-006/007 Lineage links and candidates | `crates/core/src/lineage.rs` (rule 2) | `tests/lineage.rs`: frozen-rule calibration, untouched validation, traps, comparison budget |
 | CGE-008 Background analysis and resumption | `crates/core/src/index.rs` | `tests/index.rs`: resumption after cancellation, comparison-limit overflow, deterministic analysis of every fixture |
-| CGE-009/010 Exploration UI, timeline, evidence | `crates/app/src/main.rs`, `crates/core/src/trace.rs` | Type-checked and linted only; see Remaining Work |
+| CGE-009/010 Exploration UI, timeline, evidence | `crates/app/src/main.rs`, `crates/core/src/trace.rs` | Headless keyboard-flow test; native window QA under X11 at three scales (see UI Verification) |
 | CGE-011 Accuracy and performance validation | `crates/core/tests/lineage.rs`, `crates/core/examples/measure.rs` | Accuracy measured; performance measured on the development container, not the baseline PC |
 
-43 tests pass in the core and fixture crates. Clippy with warnings as errors and rustfmt pass for every crate. The app builds only for Windows; on Linux it was type-checked and linted by enabling eframe's X11 backend on the command line, without changing any manifest.
+43 tests pass in the core and fixture crates, plus one app test and one opt-in app measurement. Clippy with warnings as errors and rustfmt pass for every crate. The app's manifest targets Windows only; on Linux it was built, tested, and linted by enabling eframe's X11 backend on the command line (`--features eframe/x11`) without changing any manifest.
 
 ## Lineage Accuracy
 
@@ -42,7 +42,15 @@ These figures come from the 1,000-commit benchmark (generator version 2, HEAD `2
 
 Environment: Linux x86_64 container, Intel Xeon at 2.80 GHz with 4 vCPUs, 15 GiB RAM, release build without static CRT. A new application cache was used for each run; the OS file cache was not evicted. Peak memory was sampled from the process's `VmHWM`; the harness itself does not report it. The 25 unknown commits are the benchmark's copy commits, whose 500 overwritten functions share one signature and exceed the comparison budget.
 
-The query boundary is the harness's: trace plus the selected and earlier source evidence for the first symbol at HEAD. UI input latency during analysis was not measured.
+The query boundary is the harness's: trace plus the selected and earlier source evidence for the first symbol at HEAD.
+
+## UI Verification
+
+**Input latency during analysis:** `ui_input_stays_responsive_during_benchmark_analysis` drives the real app UI headlessly while it analyzes the benchmark. Each frame carries pointer and Tab input, and the measured span runs from input handling through tessellation on the UI thread; GPU presentation is outside it. In a release build, 1,741 frames during a 53.2 s analysis had an input p95 of 0.55 ms and a maximum of 23.9 ms, against a 100 ms target. After analysis, each keystroke in the symbol search, filtering 100,000 declarations, took at most 32.3 ms. Run it with `cargo test --release -p git-scoop -- --ignored --nocapture`, adding `--features eframe/x11` on Linux.
+
+**Keyboard operation:** `keyboard_alone_analyzes_searches_and_opens_a_timeline` uses only Tab, typed text, and Enter. It enters a repository path, starts analysis, searches for a symbol, activates the first result, and opens its timeline.
+
+**Scaling and Unicode:** The native window ran under Xvfb with Mesa at scale factors 1.0, 1.5, and 2.0. The test repository's directory, file name, identifiers, documentation comment, and string literal were all Korean. At every scale the layout kept its proportions, mouse clicks hit their scaled targets, and the timeline showed the Korean rename as `Renamed` and `Created`. Korean text rendered in labels and in the monospace source panels. The app's fallback font path (`WINDIR\Fonts\malgun.ttf`) was exercised by placing Noto Sans KR at that path, because the container has no Malgun Gothic. Rendering of Malgun Gothic itself and Windows DPI settings were not observed.
 
 ## Changes Made Toward These Results
 
@@ -67,6 +75,5 @@ The query boundary is the harness's: trace plus the selected and earlier source 
   ```
 
   The JSON report records the build profile, target, static-CRT setting, timings, cache size, and unknown commits. Peak process memory must be read separately, for example from Task Manager or Performance Monitor.
-- **UI responsiveness:** Measure UI input latency during analysis (target p95 within 100 ms) in the native window. Analysis and queries run off the UI thread, and every list renders only its visible rows, but this has not been measured.
-- **Visual QA:** Check scaling, Korean font fallback, keyboard operation, and click flows on Windows 11.
+- **Windows confirmation:** Repeat the UI latency measurement on the baseline PC, and confirm Malgun Gothic rendering and Windows display scaling in the native window. The same flows already pass headlessly and under X11.
 - **Release packaging (CGE-012):** Excluded from this scope.

@@ -10,5 +10,9 @@ anyhow.workspace = true
 eframe.workspace = true
 git-scoop-core = { path = "../core" }
 
+[dev-dependencies]
+tempfile.workspace = true
+git-scoop-fixtures = { path = "../../tools/fixtures" }
+
 [lints]
 workspace = true

@@ -86,7 +86,7 @@ Acceptance: resumption after cancellation or app exit matches a full run. Ignore
 
 P1 · Dependencies: 004, 008
 
-Status: implemented in code and type-checked. Windows visual QA and UI responsiveness measurement remain.
+Status: implemented and tested. A keyboard-only flow test passes, and the native window was checked at scales 1.0, 1.5, and 2.0 with Korean paths and source under X11. Confirmation with Malgun Gothic and Windows display scaling remains.
 
 Build repository selection, ref/commit selection, file/symbol lists, name search, and analysis progress/cancellation/error display.
 
@@ -96,7 +96,7 @@ Acceptance: use real cache/Git data. Show the selected commit and supported/anal
 
 P1 · Dependencies: 007, 009
 
-Status: implemented in code; trace and source queries are tested. Native UI verification remains.
+Status: implemented and tested. Trace and source queries are tested, and a Korean rename appeared correctly in the native timeline under X11.
 
 From timeline selection, navigate to before/after symbols and surrounding source, events, commit/parent/previous-path information, and candidate/evidence panels.
 
@@ -106,7 +106,7 @@ Acceptance: explore earlier source after name/file moves. Distinguish multiple e
 
 P1 · Dependencies: 008, 010
 
-Status: accuracy criteria met. Performance targets were met on the development container only; baseline-PC, UI-latency, and offline-package measurements remain. [Development status](STATUS.md)
+Status: accuracy criteria met. Performance and UI input latency targets were met on the development container; baseline-PC and offline-package confirmation remain. [Development status](STATUS.md)
 
 Measure accuracy, initial analysis, cached queries, memory, cache, and UI responsiveness on the current development PC using fixed CGE-002 synthetic fixtures. Record actual PC specifications, power mode, build, and measurement conditions. Verify blocked-network operation and unchanged target repositories.
 

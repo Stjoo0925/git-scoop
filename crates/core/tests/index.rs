@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use git_scoop_core::{index, store::SnapshotStore, syntax::EXTRACTOR_VERSION};
-use git_scoop_fixtures::{generate_suite, git_output};
+use git_scoop_fixtures::{FixtureRepository, generate_suite, git_output};
 use std::{
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
@@ -97,6 +97,80 @@ fn cancelled_checkpoint_resumes_to_identical_persisted_lineage_and_fixed_target(
             "Displayed source differs from its cached symbol"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn comparison_limit_commit_is_persisted_unknown_and_analysis_continues() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("limit");
+    let mut repo = FixtureRepository::create(&root, 31)?;
+    let functions = |prefix: &str| {
+        (0..320)
+            .map(|i| format!("fn {prefix}_{i}() -> u64 {{ 1 }}\n"))
+            .collect::<String>()
+    };
+    repo.write("src/keep.rs", b"fn stable() -> u8 { 3 }\n")?;
+    repo.write("src/a.rs", functions("old").as_bytes())?;
+    repo.commit("Add related functions", Vec::new(), Vec::new())?;
+    // 320 x 320 unmatched functions sharing a signature exceed the pair budget.
+    repo.remove("src/a.rs")?;
+    repo.write("src/b.rs", functions("new").as_bytes())?;
+    let overflow = repo
+        .commit("Replace every function", Vec::new(), Vec::new())?
+        .oid;
+    repo.write("src/keep.rs", b"fn stable() -> u8 { 4 }\n")?;
+    let target = repo
+        .commit("Change a later body", Vec::new(), Vec::new())?
+        .oid;
+
+    let cache = temporary.path().join("cache.db");
+    let cancel = AtomicBool::new(false);
+    let analysis = index::analyze(&root, "HEAD", &cache, &cancel, |_| {})?;
+    ensure!(
+        analysis.history.commits.len() == 3 && analysis.unknown_commits == 1,
+        "The overflow commit was not reported once as unknown"
+    );
+    let store = SnapshotStore::open(&cache)?;
+    let rule = index::rule_version();
+    ensure!(
+        store
+            .checkpoint(&target, &rule, EXTRACTOR_VERSION)?
+            .as_deref()
+            == Some(target.as_str()),
+        "Analysis did not complete past the overflow commit"
+    );
+    ensure!(
+        store
+            .load_global_states(&target, &overflow, &rule, EXTRACTOR_VERSION)?
+            .iter()
+            .any(|state| state.kind == "Incomplete" && state.evidence == "ComparisonLimit"),
+        "The overflow was not recorded as incomplete"
+    );
+    let blob = String::from_utf8(git_output(
+        &root,
+        &["rev-parse", &format!("{overflow}:src/b.rs")],
+    )?)?
+    .trim()
+    .to_owned();
+    let added = git_scoop_core::store::StoredLocation {
+        commit_id: overflow.clone(),
+        path: b"src/b.rs".to_vec(),
+        blob_id: blob,
+        symbol_index: 0,
+    };
+    let states = store.load_location_states(&target, &added, &rule, EXTRACTOR_VERSION)?;
+    ensure!(
+        !states.is_empty() && states.iter().all(|state| state.kind == "Unknown"),
+        "An unexamined observation was reported as created"
+    );
+    ensure!(
+        store
+            .load_edges(&target, &rule, EXTRACTOR_VERSION)?
+            .iter()
+            .any(|edge| edge.events.contains(&"BodyChanged".to_owned())),
+        "The later commit was not linked after the overflow"
+    );
     Ok(())
 }
 

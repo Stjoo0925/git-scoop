@@ -3,12 +3,11 @@ mod cases;
 mod repository;
 
 use anyhow::{Result, ensure};
-use repository::FixtureRepository;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 pub use benchmark::{BENCHMARK_BYTES, BENCHMARK_COMMITS, BENCHMARK_FILES, generate_benchmark};
-pub use repository::git_output;
+pub use repository::{FixtureRepository, git_output};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

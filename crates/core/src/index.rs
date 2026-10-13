@@ -128,11 +128,10 @@ pub fn analyze(
                 !pair.incomplete.contains(&IncompleteReason::Cancelled),
                 "Analysis was cancelled."
             );
-            ensure!(
-                !pair.incomplete.contains(&IncompleteReason::ComparisonLimit),
-                "The 100,000 comparison limit was reached at {}. Unexamined lineage is unknown; this commit has no completion checkpoint.",
-                metadata.commit_id
-            );
+            // A comparison-limit overflow is persisted like a parse error: the
+            // pair keeps an Incomplete state and its unexamined observations
+            // stay Unknown, so later commits remain analyzable without
+            // reporting the overflow as deletion, creation, or full analysis.
             for item in &pair.links {
                 request.edges.push(StoredEdge { before: location(before, item.before)?, after: location(&current, item.after)?, events: item.events.iter().map(|event| format!("{event:?}")).collect(), evidence: serde_json::to_string(&serde_json::json!({"same_path":item.evidence.same_path,"same_name":item.evidence.same_name,"same_context":item.evidence.same_context,"same_signature":item.evidence.same_signature,"same_body":item.evidence.same_body,"same_tokens":item.evidence.same_tokens,"same_structure":item.evidence.same_structure,"score":item.evidence.score,"compared_parent": before.commit_id,"rule":pair.rule_version}))? });
             }

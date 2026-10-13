@@ -59,11 +59,11 @@ fn migration_preserves_legacy_counts_and_rejects_newer_schema() -> Result<()> {
     drop(connection);
     let store = SnapshotStore::open(&path)?;
     assert_eq!(store.recorded_counts("legacy")?, (2, 3, 1));
-    assert_eq!(scalar(&path, "PRAGMA user_version")?, 3);
-    drop(store);
-    Connection::open(&path)?.pragma_update(None, "user_version", 4)?;
-    assert!(SnapshotStore::open(&path).is_err());
     assert_eq!(scalar(&path, "PRAGMA user_version")?, 4);
+    drop(store);
+    Connection::open(&path)?.pragma_update(None, "user_version", 5)?;
+    assert!(SnapshotStore::open(&path).is_err());
+    assert_eq!(scalar(&path, "PRAGMA user_version")?, 5);
     Ok(())
 }
 
@@ -438,8 +438,25 @@ fn symbol_foreign_keys_reject_invalid_observation_inserts() -> Result<()> {
     Ok(())
 }
 
+/// Restore the schema 2 layout: full version keys in every row, no interned
+/// version table, and no precise state locations.
 fn downgrade_states_to_v2(path: &Path) -> Result<()> {
-    Connection::open(path)?.execute_batch("DROP INDEX states_observation; ALTER TABLE analysis_states DROP COLUMN observation_id; PRAGMA user_version=2;")?;
+    let connection = Connection::open(path)?;
+    connection.execute_batch("PRAGMA foreign_keys=ON; BEGIN; PRAGMA defer_foreign_keys=ON;")?;
+    for table in [
+        "parse_units",
+        "extracted_symbols",
+        "observations",
+        "lineage_edges",
+        "analysis_states",
+        "checkpoints",
+    ] {
+        connection.execute(
+            &format!("UPDATE {table} SET version=(SELECT key FROM extractor_versions WHERE CAST(version_id AS TEXT)={table}.version)"),
+            [],
+        )?;
+    }
+    connection.execute_batch("DROP TABLE extractor_versions; DROP INDEX states_observation; ALTER TABLE analysis_states DROP COLUMN observation_id; PRAGMA user_version=2; COMMIT;")?;
     Ok(())
 }
 
@@ -475,8 +492,22 @@ fn schema_two_migration_preserves_states_and_indexes_precise_locations() -> Resu
     drop(store);
     downgrade_states_to_v2(&path)?;
     assert_eq!(scalar(&path, "PRAGMA user_version")?, 2);
+    assert_eq!(
+        scalar(
+            &path,
+            "SELECT COUNT(*) FROM observations WHERE version NOT LIKE '[%'"
+        )?,
+        0
+    );
     let store = SnapshotStore::open(&path)?;
-    assert_eq!(scalar(&path, "PRAGMA user_version")?, 3);
+    assert_eq!(scalar(&path, "PRAGMA user_version")?, 4);
+    assert_eq!(
+        scalar(
+            &path,
+            "SELECT COUNT(*) FROM observations WHERE version LIKE '[%'"
+        )?,
+        0
+    );
     assert_eq!(
         store
             .load_parse("blob", parsed.version)?
@@ -555,5 +586,64 @@ fn schema_two_state_migration_failure_rolls_back_column_index_and_version() -> R
     );
     assert_eq!(scalar(&path, "SELECT COUNT(*) FROM parse_units")?, 1);
     assert_eq!(scalar(&path, "SELECT COUNT(*) FROM checkpoints")?, 1);
+    Ok(())
+}
+
+#[test]
+fn compact_symbols_roundtrip_read_legacy_json_and_reject_corruption() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cache.db");
+    let mut store = SnapshotStore::open(&path)?;
+    let parsed = extract_rust(
+        "mod outer { struct A; impl A { fn run(&self) -> u8 { 1 } } trait T { fn declared(&self); } fn broken( }",
+    )?;
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.body_range.is_none())
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| !symbol.context.is_empty())
+    );
+    store.save_parse("blob", &parsed)?;
+    let loaded = store
+        .load_parse("blob", parsed.version)?
+        .context("Compact parse")?;
+    assert_eq!(loaded.symbols, parsed.symbols);
+    assert!(scalar(&path, "SELECT MAX(length(payload)) FROM extracted_symbols")? < 300);
+    assert_eq!(
+        scalar(
+            &path,
+            "SELECT COUNT(*) FROM extracted_symbols WHERE version LIKE '[%'"
+        )?,
+        0
+    );
+
+    // Rows written before schema 4 hold JSON symbols and stay readable.
+    let connection = Connection::open(&path)?;
+    for (index, symbol) in parsed.symbols.iter().enumerate() {
+        connection.execute(
+            "UPDATE extracted_symbols SET payload=?1 WHERE blob_id='blob' AND symbol_index=?2",
+            params![serde_json::to_vec(symbol)?, i64::try_from(index)?],
+        )?;
+    }
+    assert_eq!(
+        store
+            .load_parse("blob", parsed.version)?
+            .context("Legacy parse")?
+            .symbols,
+        parsed.symbols
+    );
+    store.save_parse("blob", &parsed)?;
+
+    connection.execute(
+        "UPDATE extracted_symbols SET payload=x'01ff' WHERE blob_id='blob' AND symbol_index=0",
+        [],
+    )?;
+    assert!(store.load_parse("blob", parsed.version).is_err());
     Ok(())
 }

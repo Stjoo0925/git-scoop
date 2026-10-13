@@ -1,5 +1,5 @@
 use crate::{
-    CACHE_BUDGET_BYTES, ExtractorVersion, ParsedRust,
+    CACHE_BUDGET_BYTES, ExtractorVersion, ParsedRust, Symbol, SymbolFingerprints, SymbolKind,
     git::{CommitMetadata, Snapshot, TreeFile},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredLocation {
@@ -118,7 +118,12 @@ impl SnapshotStore {
             if version < 2 {
                 transaction.execute_batch(SCHEMA)?;
             }
-            migrate_location_states(&transaction)?;
+            if version < 3 {
+                migrate_location_states(&transaction)?;
+            }
+            if version < 4 {
+                migrate_interned_versions(&transaction)?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             finish(transaction, path, budget)?;
             truncate_wal(&connection)?;
@@ -132,7 +137,6 @@ impl SnapshotStore {
     }
 
     pub fn save_parse(&mut self, blob_id: &str, parsed: &ParsedRust) -> Result<()> {
-        let version = version_key(parsed.version);
         let payload = serde_json::to_vec(&ParsePayload {
             symbol_count: parsed.symbols.len(),
             has_error: parsed.has_error,
@@ -142,37 +146,30 @@ impl SnapshotStore {
         let symbols = parsed
             .symbols
             .iter()
-            .map(serde_json::to_vec)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let existing: Option<Vec<u8>> = self
-            .connection
-            .query_row(
-                "SELECT payload FROM parse_units WHERE blob_id=?1 AND version=?2",
-                params![blob_id, version],
-                |row| row.get(0),
-            )
-            .optional()?;
+            .map(encode_symbol)
+            .collect::<Result<Vec<_>>>()?;
+        let existing: Option<Vec<u8>> = match find_version(&self.connection, parsed.version)? {
+            Some(version) => self
+                .connection
+                .query_row(
+                    "SELECT payload FROM parse_units WHERE blob_id=?1 AND version=?2",
+                    params![blob_id, version],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
         if let Some(existing) = existing {
             ensure!(
                 existing == payload,
                 "The immutable parse cache entry differs for the same blob and extractor version."
             );
-            let mut statement = self.connection.prepare("SELECT symbol_index,payload FROM extracted_symbols WHERE blob_id=?1 AND version=?2 ORDER BY symbol_index")?;
-            let cached = statement
-                .query_map(params![blob_id, version], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Compare decoded symbols so legacy JSON rows and compact rows agree.
+            let cached = self
+                .load_parse(blob_id, parsed.version)?
+                .context("The immutable parse cache entry is incomplete.")?;
             ensure!(
-                cached.len() == symbols.len()
-                    && cached.iter().zip(&symbols).enumerate().all(
-                        |(index, ((stored_index, stored), expected))| usize::try_from(
-                            *stored_index
-                        )
-                        .ok()
-                            == Some(index)
-                            && stored == expected
-                    ),
+                cached.symbols == parsed.symbols,
                 "The immutable extracted symbol cache differs for the same blob and extractor version."
             );
             return Ok(());
@@ -186,6 +183,7 @@ impl SnapshotStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = intern_version(&transaction, parsed.version)?;
         transaction.execute(
             "INSERT INTO parse_units(blob_id,version,payload) VALUES(?1,?2,?3)",
             params![blob_id, version, payload],
@@ -202,11 +200,14 @@ impl SnapshotStore {
         blob_id: &str,
         version: ExtractorVersion,
     ) -> Result<Option<ParsedRust>> {
+        let Some(key) = find_version(&self.connection, version)? else {
+            return Ok(None);
+        };
         let payload: Option<Vec<u8>> = self
             .connection
             .query_row(
                 "SELECT payload FROM parse_units WHERE blob_id=?1 AND version=?2",
-                params![blob_id, version_key(version)],
+                params![blob_id, key],
                 |row| row.get(0),
             )
             .optional()?;
@@ -215,12 +216,12 @@ impl SnapshotStore {
                 let parsed: ParsePayload = serde_json::from_slice(&payload)
                     .context("The cached parse metadata is invalid.")?;
                 let mut statement=self.connection.prepare("SELECT symbol_index,payload FROM extracted_symbols WHERE blob_id=?1 AND version=?2 ORDER BY symbol_index")?;
-                let rows=statement.query_map(params![blob_id,version_key(version)],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?)))?;
+                let rows=statement.query_map(params![blob_id,key],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?)))?;
                 let mut symbols=Vec::new();
                 for row in rows {
                     let (index,payload)=row?;
                     ensure!(usize::try_from(index).ok()==Some(symbols.len()), "The extracted symbol cache has incomplete indices.");
-                    symbols.push(serde_json::from_slice(&payload).context("The cached symbol metadata is invalid.")?);
+                    symbols.push(decode_symbol(&payload).context("The cached symbol metadata is invalid.")?);
                 }
                 ensure!(symbols.len()==parsed.symbol_count,"The extracted symbol cache is incomplete.");
                 Ok(ParsedRust {
@@ -239,10 +240,10 @@ impl SnapshotStore {
         check_cancelled(cancelled)?;
         let estimate = commit_estimate(request)?;
         self.prepare_write(estimate)?;
-        let version = version_key(request.extractor_version);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = intern_version(&transaction, request.extractor_version)?;
         transaction.execute(
             "INSERT INTO commits(commit_id,tree_id,message) VALUES(?1,?2,?3)
             ON CONFLICT(commit_id) DO UPDATE SET tree_id=excluded.tree_id,message=excluded.message",
@@ -324,8 +325,11 @@ impl SnapshotStore {
         rule_version: &str,
         version: ExtractorVersion,
     ) -> Result<Option<String>> {
+        let Some(version) = find_version(&self.connection, version)? else {
+            return Ok(None);
+        };
         Ok(self.connection.query_row("SELECT commit_id FROM checkpoints WHERE target_id=?1 AND rule_version=?2 AND version=?3",
-            params![target_id, rule_version, version_key(version)], |row| row.get(0)).optional()?)
+            params![target_id, rule_version, version], |row| row.get(0)).optional()?)
     }
 
     pub fn load_edges(
@@ -416,7 +420,9 @@ impl SnapshotStore {
         rule_version: &str,
         version: ExtractorVersion,
     ) -> Result<Vec<StoredState>> {
-        let version = version_key(version);
+        let Some(version) = find_version(&self.connection, version)? else {
+            return Ok(Vec::new());
+        };
         let observation:Option<i64>=self.connection.query_row("SELECT observation_id FROM observations WHERE commit_id=?1 AND path=?2 AND blob_id=?3 AND version=?4 AND symbol_index=?5",
             params![location.commit_id,location.path,location.blob_id,version,i64::try_from(location.symbol_index)?],|row|row.get(0)).optional()?;
         let Some(observation) = observation else {
@@ -438,13 +444,10 @@ impl SnapshotStore {
         rule_version: &str,
         version: ExtractorVersion,
     ) -> Result<Vec<StoredState>> {
-        self.query_location_states(
-            target_id,
-            commit_id,
-            rule_version,
-            &version_key(version),
-            None,
-        )
+        let Some(version) = find_version(&self.connection, version)? else {
+            return Ok(Vec::new());
+        };
+        self.query_location_states(target_id, commit_id, rule_version, &version, None)
     }
 
     fn query_location_states(
@@ -485,9 +488,12 @@ impl SnapshotStore {
         rule_version: &str,
         version: ExtractorVersion,
     ) -> Result<Vec<StoredState>> {
+        let Some(version) = find_version(&self.connection, version)? else {
+            return Ok(Vec::new());
+        };
         let mut statement=self.connection.prepare("SELECT location,kind,evidence FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4 ORDER BY position")?;
         let rows = statement.query_map(
-            params![target_id, commit_id, rule_version, version_key(version)],
+            params![target_id, commit_id, rule_version, version],
             |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -514,8 +520,11 @@ impl SnapshotStore {
         rule_version: &str,
         version: ExtractorVersion,
     ) -> Result<usize> {
+        let Some(version) = find_version(&self.connection, version)? else {
+            return Ok(0);
+        };
         let count:i64=self.connection.query_row("SELECT COUNT(DISTINCT commit_id) FROM analysis_states WHERE target_id=?1 AND rule_version=?2 AND version=?3 AND lower(kind) IN ('unknown','incomplete','skippedfile','skipped_file')",
-            params![target_id,rule_version,version_key(version)],|row|row.get(0))?;
+            params![target_id,rule_version,version],|row|row.get(0))?;
         Ok(usize::try_from(count)?)
     }
 
@@ -527,6 +536,9 @@ impl SnapshotStore {
         decision: &str,
         location: Option<&StoredLocation>,
     ) -> Result<Vec<StoredEdge>> {
+        let Some(version) = find_version(&self.connection, version)? else {
+            return Ok(Vec::new());
+        };
         let location_predicate = if location.is_some() {
             " AND b.path=?4 AND b.blob_id=?5 AND b.symbol_index=?6"
         } else {
@@ -542,7 +554,7 @@ impl SnapshotStore {
             params![
                 commit_id,
                 rule_version,
-                version_key(version),
+                version,
                 location.map(|point| point.path.as_slice()),
                 location.map(|point| point.blob_id.as_str()),
                 location
@@ -640,6 +652,227 @@ fn version_key(version: ExtractorVersion) -> String {
         version.fingerprints,
     ))
     .expect("Primitive version metadata serializes")
+}
+
+/// Rows store a short interned identifier instead of repeating the full
+/// version key; the key remains the collision-free identity in one place.
+fn find_version(connection: &Connection, version: ExtractorVersion) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT version_id FROM extractor_versions WHERE key=?1",
+            [version_key(version)],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|id| id.to_string()))
+}
+
+fn intern_version(transaction: &Transaction<'_>, version: ExtractorVersion) -> Result<String> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO extractor_versions(key) VALUES(?1)",
+        [version_key(version)],
+    )?;
+    find_version(transaction, version)?.context("The extractor version was not interned.")
+}
+
+/// Replace full version keys written by schema 3 and earlier with interned
+/// identifiers. Interned identifiers are decimal and legacy keys are JSON
+/// arrays, so the two forms cannot be confused.
+fn migrate_interned_versions(transaction: &Transaction<'_>) -> Result<()> {
+    const TABLES: [&str; 6] = [
+        "parse_units",
+        "extracted_symbols",
+        "observations",
+        "lineage_edges",
+        "analysis_states",
+        "checkpoints",
+    ];
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS extractor_versions(version_id INTEGER PRIMARY KEY,key TEXT NOT NULL UNIQUE);")?;
+    // Parent and child keys change in separate statements within one transaction.
+    transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
+    for table in TABLES {
+        transaction.execute(
+            &format!(
+                "INSERT OR IGNORE INTO extractor_versions(key)
+                SELECT DISTINCT version FROM {table} WHERE version LIKE '[%'"
+            ),
+            [],
+        )?;
+    }
+    for table in TABLES {
+        transaction.execute(
+            &format!(
+                "UPDATE {table} SET version=(SELECT CAST(version_id AS TEXT) FROM extractor_versions WHERE key={table}.version)
+                WHERE version LIKE '[%'"
+            ),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+const SYMBOL_FORMAT: u8 = 1;
+
+/// Fixed little-endian layout for cached symbols. Fingerprints dominate the
+/// size, and JSON would spell every fingerprint byte as a decimal number.
+fn encode_symbol(symbol: &Symbol) -> Result<Vec<u8>> {
+    fn put(out: &mut Vec<u8>, value: usize) -> Result<()> {
+        out.extend_from_slice(
+            &u32::try_from(value)
+                .context("A symbol field exceeds the cache format")?
+                .to_le_bytes(),
+        );
+        Ok(())
+    }
+    fn put_text(out: &mut Vec<u8>, text: &str) -> Result<()> {
+        put(out, text.len())?;
+        out.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+    let mut out = vec![SYMBOL_FORMAT];
+    put_text(&mut out, &symbol.name)?;
+    out.push(match symbol.kind {
+        SymbolKind::Function => 0,
+        SymbolKind::Method => 1,
+        SymbolKind::TraitMethod => 2,
+        SymbolKind::Struct => 3,
+        SymbolKind::Enum => 4,
+        SymbolKind::Trait => 5,
+    });
+    put(&mut out, symbol.context.len())?;
+    for part in &symbol.context {
+        put_text(&mut out, part)?;
+    }
+    for value in [
+        symbol.start_byte,
+        symbol.end_byte,
+        symbol.line,
+        symbol.signature_range.start,
+        symbol.signature_range.end,
+    ] {
+        put(&mut out, value)?;
+    }
+    out.push(u8::from(symbol.has_error));
+    match &symbol.body_range {
+        Some(range) => {
+            out.push(1);
+            put(&mut out, range.start)?;
+            put(&mut out, range.end)?;
+        }
+        None => out.push(0),
+    }
+    let fingerprints = &symbol.fingerprints;
+    for hash in [
+        &fingerprints.raw,
+        &fingerprints.normalized_tokens,
+        &fingerprints.structural,
+        &fingerprints.signature,
+    ] {
+        out.extend_from_slice(hash);
+    }
+    match &fingerprints.body {
+        Some(hash) => {
+            out.push(1);
+            out.extend_from_slice(hash);
+        }
+        None => out.push(0),
+    }
+    Ok(out)
+}
+
+/// Read compact symbols, or JSON symbols written before schema 4.
+fn decode_symbol(payload: &[u8]) -> Result<Symbol> {
+    struct Reader<'a>(&'a [u8]);
+    impl<'a> Reader<'a> {
+        fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+            ensure!(length <= self.0.len(), "The cached symbol is truncated.");
+            let (head, tail) = self.0.split_at(length);
+            self.0 = tail;
+            Ok(head)
+        }
+        fn byte(&mut self) -> Result<u8> {
+            Ok(self.take(1)?[0])
+        }
+        fn flag(&mut self) -> Result<bool> {
+            match self.byte()? {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => bail!("The cached symbol has an invalid flag."),
+            }
+        }
+        fn number(&mut self) -> Result<usize> {
+            let bytes: [u8; 4] = self.take(4)?.try_into()?;
+            Ok(usize::try_from(u32::from_le_bytes(bytes))?)
+        }
+        fn text(&mut self) -> Result<String> {
+            let length = self.number()?;
+            Ok(std::str::from_utf8(self.take(length)?)?.to_owned())
+        }
+        fn hash(&mut self) -> Result<[u8; 32]> {
+            Ok(self.take(32)?.try_into()?)
+        }
+    }
+    if payload.first() == Some(&b'{') {
+        return Ok(serde_json::from_slice(payload)?);
+    }
+    let mut reader = Reader(payload);
+    ensure!(
+        reader.byte()? == SYMBOL_FORMAT,
+        "The cached symbol format is unsupported."
+    );
+    let name = reader.text()?;
+    let kind = match reader.byte()? {
+        0 => SymbolKind::Function,
+        1 => SymbolKind::Method,
+        2 => SymbolKind::TraitMethod,
+        3 => SymbolKind::Struct,
+        4 => SymbolKind::Enum,
+        5 => SymbolKind::Trait,
+        _ => bail!("The cached symbol kind is invalid."),
+    };
+    let parts = reader.number()?;
+    // Each context part needs at least its length prefix.
+    ensure!(
+        parts <= reader.0.len() / 4,
+        "The cached symbol context is truncated."
+    );
+    let context = (0..parts)
+        .map(|_| reader.text())
+        .collect::<Result<Vec<_>>>()?;
+    let start_byte = reader.number()?;
+    let end_byte = reader.number()?;
+    let line = reader.number()?;
+    let signature_range = reader.number()?..reader.number()?;
+    let has_error = reader.flag()?;
+    let body_range = if reader.flag()? {
+        Some(reader.number()?..reader.number()?)
+    } else {
+        None
+    };
+    let fingerprints = SymbolFingerprints {
+        raw: reader.hash()?,
+        normalized_tokens: reader.hash()?,
+        structural: reader.hash()?,
+        signature: reader.hash()?,
+        body: if reader.flag()? {
+            Some(reader.hash()?)
+        } else {
+            None
+        },
+    };
+    ensure!(reader.0.is_empty(), "The cached symbol has trailing data.");
+    Ok(Symbol {
+        name,
+        kind,
+        context,
+        start_byte,
+        end_byte,
+        line,
+        has_error,
+        signature_range,
+        body_range,
+        fingerprints,
+    })
 }
 
 fn migrate_location_states(transaction: &Transaction<'_>) -> Result<()> {

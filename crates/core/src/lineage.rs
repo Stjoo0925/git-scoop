@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::Result;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -110,6 +110,18 @@ fn observations(snapshot: &Snapshot) -> Vec<ObservationId> {
         })
         .collect()
 }
+/// Position of each file's first observation in `observations` order.
+fn file_offsets(snapshot: &Snapshot) -> Vec<usize> {
+    snapshot
+        .files
+        .iter()
+        .scan(0, |next, file| {
+            let start = *next;
+            *next += file.parsed.symbols.len();
+            Some(start)
+        })
+        .collect()
+}
 fn valid(snapshot: &Snapshot, id: ObservationId) -> bool {
     !snapshot.files[id.file_index].parsed.has_error && !symbol(snapshot, id).has_error
 }
@@ -127,7 +139,7 @@ fn identity(snapshot: &Snapshot, id: ObservationId) -> (Vec<u8>, String, Vec<Str
 /// context. `evidence` scores a pair above zero only when it shares one of the
 /// proposal keys, and a copy candidate additionally requires a shared body or
 /// token key, so indexing by these keys skips only pairs that score zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum MatchKey<'a> {
     Name(&'a str),
     Tokens([u8; 32]),
@@ -135,7 +147,8 @@ enum MatchKey<'a> {
     Structure([u8; 32]),
     Body([u8; 32]),
 }
-type MatchIndex<'a> = BTreeMap<(&'static str, &'a [String], MatchKey<'a>), Vec<usize>>;
+type Scoped<'a> = (&'static str, &'a [String], MatchKey<'a>);
+type MatchIndex<'a> = HashMap<Scoped<'a>, Vec<usize>>;
 
 fn proposal_keys(item: &Symbol) -> impl Iterator<Item = MatchKey<'_>> {
     [
@@ -156,15 +169,16 @@ fn index_entries<'a>(
     ids: &[ObservationId],
     indices: impl Iterator<Item = usize>,
     keys: impl Fn(&'a Symbol) -> Vec<MatchKey<'a>>,
+    wanted: Option<&HashSet<Scoped<'a>>>,
 ) -> MatchIndex<'a> {
     let mut index = MatchIndex::new();
     for i in indices {
         let item = symbol(snapshot, ids[i]);
         for key in keys(item) {
-            index
-                .entry((item.kind.label(), item.context.as_slice(), key))
-                .or_default()
-                .push(i);
+            let key = (item.kind.label(), item.context.as_slice(), key);
+            if wanted.is_none_or(|wanted| wanted.contains(&key)) {
+                index.entry(key).or_default().push(i);
+            }
         }
     }
     index
@@ -173,7 +187,7 @@ fn lookup<'a>(
     index: &MatchIndex<'a>,
     item: &'a Symbol,
     keys: impl Iterator<Item = MatchKey<'a>>,
-    out: &mut std::collections::BTreeSet<usize>,
+    out: &mut BTreeSet<usize>,
 ) {
     for key in keys {
         if let Some(found) = index.get(&(item.kind.label(), item.context.as_slice(), key)) {
@@ -369,13 +383,22 @@ pub fn compare_snapshots(
         }
     }
     let mut halted = !versions_match || cancelled_early;
-    let mut surviving_bodies = BTreeMap::new();
+    // Only bodies of unmatched new observations are ever looked up, so
+    // preserved files contribute just the entries that can conflict.
+    let queried_bodies: HashSet<_> = right
+        .values()
+        .flatten()
+        .filter_map(|&j| symbol(after, new[j]).fingerprints.body)
+        .collect();
+    let mut surviving_bodies = HashMap::new();
     let mut copy_conflicts = vec![false; new.len()];
     for (i, id) in old.iter().enumerate().filter(|(i, _)| old_used[*i]) {
         let item = symbol(before, *id);
-        if let Some(body) = item.fingerprints.body {
+        if let Some(body) = item.fingerprints.body
+            && queried_bodies.contains(&body)
+        {
             surviving_bodies
-                .entry((item.kind.label(), item.context.clone(), body))
+                .entry((item.kind.label(), item.context.as_slice(), body))
                 .or_insert(i);
         }
     }
@@ -406,7 +429,7 @@ pub fn compare_snapshots(
                 && let Some(body) = item.fingerprints.body
             {
                 surviving_bodies
-                    .entry((item.kind.label(), item.context.clone(), body))
+                    .entry((item.kind.label(), item.context.as_slice(), body))
                     .or_insert(i);
             }
         }
@@ -440,7 +463,7 @@ pub fn compare_snapshots(
             if !e.same_body
                 && let Some(body) = target.fingerprints.body
                 && let Some(&source) =
-                    surviving_bodies.get(&(target.kind.label(), target.context.clone(), body))
+                    surviving_bodies.get(&(target.kind.label(), target.context.as_slice(), body))
             {
                 copy_conflicts[j] = true;
                 out.candidates.push(Candidate {
@@ -465,14 +488,25 @@ pub fn compare_snapshots(
         &new,
         (0..new.len()).filter(|j| !new_used[*j] && valid(after, new[*j])),
         |item| proposal_keys(item).chain(copy_keys(item)).collect(),
+        None,
     );
+    // Linked new observations are copy targets only for unmatched old ones,
+    // so index just the keys those few observations will query.
+    let queried_links: HashSet<_> = (0..old.len())
+        .filter(|i| !old_used[*i] && valid(before, old[*i]))
+        .flat_map(|i| {
+            let item = symbol(before, old[i]);
+            copy_keys(item).map(|key| (item.kind.label(), item.context.as_slice(), key))
+        })
+        .collect();
     let linked_new = index_entries(
         after,
         &new,
         (0..new.len()).filter(|j| new_used[*j] && valid(after, new[*j])),
         |item| copy_keys(item).collect(),
+        Some(&queried_links),
     );
-    let mut targets = std::collections::BTreeSet::new();
+    let mut targets = BTreeSet::new();
     'outer: for (i, a) in old.iter().enumerate() {
         if halted {
             break;
@@ -565,11 +599,13 @@ pub fn compare_snapshots(
     let uncertain = !out.incomplete.is_empty();
     let mut candidate_old = vec![false; old.len()];
     let mut candidate_new = vec![false; new.len()];
-    let old_indices: BTreeMap<_, _> = old.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-    let new_indices: BTreeMap<_, _> = new.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let old_offsets = file_offsets(before);
+    let new_offsets = file_offsets(after);
     for candidate in &out.candidates {
-        candidate_old[old_indices[&candidate.before]] = true;
-        candidate_new[new_indices[&candidate.after]] = true;
+        candidate_old[old_offsets[candidate.before.file_index] + candidate.before.symbol_index] =
+            true;
+        candidate_new[new_offsets[candidate.after.file_index] + candidate.after.symbol_index] =
+            true;
     }
     for (i, id) in old.iter().enumerate().filter(|(i, _)| !old_used[*i]) {
         let state = if uncertain || !valid(before, *id) {

@@ -122,6 +122,65 @@ fn identity(snapshot: &Snapshot, id: ObservationId) -> (Vec<u8>, String, Vec<Str
         item.name.clone(),
     )
 }
+
+/// A fingerprint or name shared by two observations of the same kind and
+/// context. `evidence` scores a pair above zero only when it shares one of the
+/// proposal keys, and a copy candidate additionally requires a shared body or
+/// token key, so indexing by these keys skips only pairs that score zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchKey<'a> {
+    Name(&'a str),
+    Tokens([u8; 32]),
+    Signature([u8; 32]),
+    Structure([u8; 32]),
+    Body([u8; 32]),
+}
+type MatchIndex<'a> = BTreeMap<(&'static str, &'a [String], MatchKey<'a>), Vec<usize>>;
+
+fn proposal_keys(item: &Symbol) -> impl Iterator<Item = MatchKey<'_>> {
+    [
+        MatchKey::Name(&item.name),
+        MatchKey::Tokens(item.fingerprints.normalized_tokens),
+        MatchKey::Signature(item.fingerprints.signature),
+        MatchKey::Structure(item.fingerprints.structural),
+    ]
+    .into_iter()
+}
+fn copy_keys(item: &Symbol) -> impl Iterator<Item = MatchKey<'_>> {
+    [MatchKey::Tokens(item.fingerprints.normalized_tokens)]
+        .into_iter()
+        .chain(item.fingerprints.body.map(MatchKey::Body))
+}
+fn index_entries<'a>(
+    snapshot: &'a Snapshot,
+    ids: &[ObservationId],
+    indices: impl Iterator<Item = usize>,
+    keys: impl Fn(&'a Symbol) -> Vec<MatchKey<'a>>,
+) -> MatchIndex<'a> {
+    let mut index = MatchIndex::new();
+    for i in indices {
+        let item = symbol(snapshot, ids[i]);
+        for key in keys(item) {
+            index
+                .entry((item.kind.label(), item.context.as_slice(), key))
+                .or_default()
+                .push(i);
+        }
+    }
+    index
+}
+fn lookup<'a>(
+    index: &MatchIndex<'a>,
+    item: &'a Symbol,
+    keys: impl Iterator<Item = MatchKey<'a>>,
+    out: &mut std::collections::BTreeSet<usize>,
+) {
+    for key in keys {
+        if let Some(found) = index.get(&(item.kind.label(), item.context.as_slice(), key)) {
+            out.extend(found);
+        }
+    }
+}
 fn evidence(before: &Snapshot, a: ObservationId, after: &Snapshot, b: ObservationId) -> Evidence {
     let x = symbol(before, a);
     let y = symbol(after, b);
@@ -398,29 +457,48 @@ pub fn compare_snapshots(
         }
     }
     let mut proposed = Vec::new();
-    let unmatched_new: Vec<_> = (0..new.len()).filter(|j| !new_used[*j]).collect();
-    let all_new: Vec<_> = (0..new.len()).collect();
+    // Unmatched new observations can become proposals or copy targets; linked
+    // ones can only be copy targets. Only pairs sharing a key are compared and
+    // counted, so unrelated symbols elsewhere in the tree cost no budget.
+    let open_new = index_entries(
+        after,
+        &new,
+        (0..new.len()).filter(|j| !new_used[*j] && valid(after, new[*j])),
+        |item| proposal_keys(item).chain(copy_keys(item)).collect(),
+    );
+    let linked_new = index_entries(
+        after,
+        &new,
+        (0..new.len()).filter(|j| new_used[*j] && valid(after, new[*j])),
+        |item| copy_keys(item).collect(),
+    );
+    let mut targets = std::collections::BTreeSet::new();
     'outer: for (i, a) in old.iter().enumerate() {
         if halted {
+            break;
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            out.incomplete.push(IncompleteReason::Cancelled);
+            halted = true;
             break;
         }
         if !valid(before, *a) {
             continue;
         }
-        let targets = if old_used[i] {
-            &unmatched_new
+        let item = symbol(before, *a);
+        targets.clear();
+        if old_used[i] {
+            lookup(&open_new, item, copy_keys(item), &mut targets);
         } else {
-            &all_new
-        };
-        for &j in targets {
+            lookup(&open_new, item, proposal_keys(item), &mut targets);
+            lookup(&linked_new, item, copy_keys(item), &mut targets);
+        }
+        for &j in &targets {
             let b = &new[j];
             if cancelled.load(Ordering::Relaxed) {
                 out.incomplete.push(IncompleteReason::Cancelled);
                 halted = true;
                 break 'outer;
-            }
-            if !valid(after, *b) {
-                continue;
             }
             if out.comparisons == MAX_COMPARISONS {
                 out.incomplete.push(IncompleteReason::ComparisonLimit);

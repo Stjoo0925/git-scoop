@@ -4,6 +4,7 @@ Git Scoop is a native Rust application for offline Git exploration. Its core MVP
 
 ## Documents and Reading Order
 
+0. [Development Status](STATUS.md): code as actually implemented, verified results, and the current blocker. Read this before the older handoff notes below.
 0. [Final Pre-implementation Decisions](DECISIONS.md): user decisions, release targets, and resource limits. These override earlier candidate descriptions.
 0. [First Implementation Validation Record](CGE-001.md): current implementation scope, installed environment, passed checks, and next work.
 0. [Ground-truth and English Text Validation](CGE-002.md): generated fixtures, independent expectations, English-only text, and current validation.

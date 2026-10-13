@@ -4,9 +4,9 @@ A native Rust application for offline Git exploration. The core MVP is Code Gene
 
 ## Current Implementation
 
-The CGE-001 foundation uses gix to read the HEAD commit, parents, tree/blob objects, and changed paths relative to the first parent, and Tree-sitter to extract Rust functions, methods, struct, enum, and trait declarations. The egui/eframe UI explores real symbols and commit source, and SQLite stores snapshot aggregate metadata.
+The core crate resolves refs to fixed commits, walks first-parent history read-only with gix, extracts Rust declarations and fingerprints with Tree-sitter, links symbols across adjacent commits, and persists parse caches, lineage, and resumable checkpoints in SQLite. The egui/eframe UI provides analysis with cancellation, symbol search, a lineage timeline, source evidence, and decision evidence.
 
-Queries currently cover only the single HEAD commit. Full lineage links, the timeline, persistent symbol caches, and a resumable index are planned for subsequent issues. Stored aggregates are not used as completed lineage analysis or parsing caches.
+See [Development Status](docs/STATUS.md) for verified results, measured lineage accuracy, and the open blocker that keeps the 1,000-commit benchmark from completing.
 
 CGE-002 is complete: 11 deterministic datasets, 600 labeled connections in each primary split, independent oracle validation, and the exact 1,000-commit benchmark are available. The application, documentation, errors, comments, and development rules are English-only. See docs/CGE-002.md and tools/fixtures/README.md for data and generator commands.
 
@@ -23,6 +23,7 @@ Enter the path to a local repository containing commits in the app. It reads HEA
 
 ## Documents
 
+- [Development Status](docs/STATUS.md)
 - [Ground-truth and English Text Validation](docs/CGE-002.md)
 - [First Implementation Validation Record](docs/CGE-001.md)
 - [Final Decisions](docs/DECISIONS.md)

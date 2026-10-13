@@ -43,9 +43,14 @@ pub struct StoredState {
     pub evidence: String,
 }
 
+/// A blob ID and its parse result, not yet in the parse cache.
+pub type NewParse = (String, std::sync::Arc<ParsedRust>);
+
 #[derive(Debug)]
 pub struct StoreCommit {
     pub target_id: String,
+    /// New parse results, persisted in the same transaction as the commit.
+    pub parses: Vec<NewParse>,
     pub metadata: CommitMetadata,
     pub files: Vec<TreeFile>,
     pub edges: Vec<StoredEdge>,
@@ -90,6 +95,8 @@ impl SnapshotStore {
         let mut connection =
             Connection::open(path).context("Could not open the local SQLite cache.")?;
         connection.busy_timeout(Duration::from_secs(2))?;
+        // Analysis reuses a few dozen statements for every commit.
+        connection.set_prepared_statement_cache_capacity(64);
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
             version <= SCHEMA_VERSION,
@@ -137,61 +144,15 @@ impl SnapshotStore {
     }
 
     pub fn save_parse(&mut self, blob_id: &str, parsed: &ParsedRust) -> Result<()> {
-        let payload = serde_json::to_vec(&ParsePayload {
-            symbol_count: parsed.symbols.len(),
-            has_error: parsed.has_error,
-            diagnostics: parsed.diagnostics.clone(),
-            unsupported: parsed.unsupported.clone(),
-        })?;
-        let symbols = parsed
-            .symbols
-            .iter()
-            .map(encode_symbol)
-            .collect::<Result<Vec<_>>>()?;
-        let existing: Option<Vec<u8>> = match find_version(&self.connection, parsed.version)? {
-            Some(version) => self
-                .connection
-                .query_row(
-                    "SELECT payload FROM parse_units WHERE blob_id=?1 AND version=?2",
-                    params![blob_id, version],
-                    |row| row.get(0),
-                )
-                .optional()?,
-            None => None,
-        };
-        if let Some(existing) = existing {
-            ensure!(
-                existing == payload,
-                "The immutable parse cache entry differs for the same blob and extractor version."
-            );
-            // Compare decoded symbols so legacy JSON rows and compact rows agree.
-            let cached = self
-                .load_parse(blob_id, parsed.version)?
-                .context("The immutable parse cache entry is incomplete.")?;
-            ensure!(
-                cached.symbols == parsed.symbols,
-                "The immutable extracted symbol cache differs for the same blob and extractor version."
-            );
+        let encoded = encode_parse(parsed)?;
+        if existing_parse_matches(&self.connection, blob_id, parsed, &encoded)? {
             return Ok(());
         }
-        let estimate = symbols.iter().try_fold(payload.len(), |total, symbol| {
-            total
-                .checked_add(symbol.len() + 256)
-                .context("Parse cache size overflow")
-        })?;
-        self.prepare_write(estimate.saturating_mul(4))?;
+        self.prepare_write(encoded.estimate()?.saturating_mul(4))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version = intern_version(&transaction, parsed.version)?;
-        transaction.execute(
-            "INSERT INTO parse_units(blob_id,version,payload) VALUES(?1,?2,?3)",
-            params![blob_id, version, payload],
-        )?;
-        for (index, symbol) in symbols.iter().enumerate() {
-            transaction.execute("INSERT INTO extracted_symbols(blob_id,version,symbol_index,payload) VALUES(?1,?2,?3,?4)",
-                    params![blob_id, version, i64::try_from(index)?, symbol])?;
-        }
+        insert_parse(&transaction, blob_id, parsed.version, &encoded)?;
         finish(transaction, &self.path, self.budget)
     }
 
@@ -200,70 +161,53 @@ impl SnapshotStore {
         blob_id: &str,
         version: ExtractorVersion,
     ) -> Result<Option<ParsedRust>> {
-        let Some(key) = find_version(&self.connection, version)? else {
-            return Ok(None);
-        };
-        let payload: Option<Vec<u8>> = self
-            .connection
-            .query_row(
-                "SELECT payload FROM parse_units WHERE blob_id=?1 AND version=?2",
-                params![blob_id, key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        payload
-            .map(|payload| {
-                let parsed: ParsePayload = serde_json::from_slice(&payload)
-                    .context("The cached parse metadata is invalid.")?;
-                let mut statement=self.connection.prepare("SELECT symbol_index,payload FROM extracted_symbols WHERE blob_id=?1 AND version=?2 ORDER BY symbol_index")?;
-                let rows=statement.query_map(params![blob_id,key],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?)))?;
-                let mut symbols=Vec::new();
-                for row in rows {
-                    let (index,payload)=row?;
-                    ensure!(usize::try_from(index).ok()==Some(symbols.len()), "The extracted symbol cache has incomplete indices.");
-                    symbols.push(decode_symbol(&payload).context("The cached symbol metadata is invalid.")?);
-                }
-                ensure!(symbols.len()==parsed.symbol_count,"The extracted symbol cache is incomplete.");
-                Ok(ParsedRust {
-                    symbols,
-                    has_error: parsed.has_error,
-                    version,
-                    diagnostics: parsed.diagnostics,
-                    unsupported: parsed.unsupported,
-                })
-            })
-            .transpose()
+        read_parse(&self.connection, blob_id, version)
     }
 
     /// Commit observations, decisions, incomplete states, and checkpoint atomically.
     pub fn record_commit(&mut self, request: &StoreCommit, cancelled: &AtomicBool) -> Result<()> {
         check_cancelled(cancelled)?;
-        let estimate = commit_estimate(request)?;
+        let parses = request
+            .parses
+            .iter()
+            .map(|(blob_id, parsed)| Ok((blob_id, parsed, encode_parse(parsed)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut estimate = commit_estimate(request)?;
+        for (_, _, encoded) in &parses {
+            estimate = estimate
+                .checked_add(encoded.estimate()?.saturating_mul(4))
+                .context("Cache transaction size overflow")?;
+        }
         self.prepare_write(estimate)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (blob_id, parsed, encoded) in &parses {
+            check_cancelled(cancelled)?;
+            if !existing_parse_matches(&transaction, blob_id, parsed, encoded)? {
+                insert_parse(&transaction, blob_id, parsed.version, encoded)?;
+            }
+        }
         let version = intern_version(&transaction, request.extractor_version)?;
-        transaction.execute(
-            "INSERT INTO commits(commit_id,tree_id,message) VALUES(?1,?2,?3)
+        transaction
+            .prepare_cached(
+                "INSERT INTO commits(commit_id,tree_id,message) VALUES(?1,?2,?3)
             ON CONFLICT(commit_id) DO UPDATE SET tree_id=excluded.tree_id,message=excluded.message",
-            params![
+            )?
+            .execute(params![
                 request.metadata.commit_id,
                 request.metadata.tree_id,
                 request.metadata.message
-            ],
-        )?;
+            ])?;
         for (position, parent) in request.metadata.parents.iter().enumerate() {
             check_cancelled(cancelled)?;
-            transaction.execute("INSERT INTO commit_parents(commit_id,position,parent_id,analyzed) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(commit_id,position) DO UPDATE SET parent_id=excluded.parent_id,analyzed=excluded.analyzed",
-                params![request.metadata.commit_id, i64::try_from(position)?, parent, position == 0])?;
+            transaction.prepare_cached("INSERT INTO commit_parents(commit_id,position,parent_id,analyzed) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(commit_id,position) DO UPDATE SET parent_id=excluded.parent_id,analyzed=excluded.analyzed")?.execute(params![request.metadata.commit_id, i64::try_from(position)?, parent, position == 0])?;
         }
         for file in &request.files {
             check_cancelled(cancelled)?;
-            transaction.execute("INSERT INTO commit_files(commit_id,path,blob_id,mode) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(commit_id,path) DO UPDATE SET blob_id=excluded.blob_id,mode=excluded.mode",
-                params![request.metadata.commit_id, file.path, file.object_id, file.mode])?;
+            transaction.prepare_cached("INSERT INTO commit_files(commit_id,path,blob_id,mode) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(commit_id,path) DO UPDATE SET blob_id=excluded.blob_id,mode=excluded.mode")?.execute(params![request.metadata.commit_id, file.path, file.object_id, file.mode])?;
         }
         for edge in &request.edges {
             check_cancelled(cancelled)?;
@@ -291,8 +235,7 @@ impl SnapshotStore {
                 &version,
             )?;
         }
-        transaction.execute("DELETE FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4",
-            params![request.target_id, request.metadata.commit_id, request.rule_version, version])?;
+        transaction.prepare_cached("DELETE FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4")?.execute(params![request.target_id, request.metadata.commit_id, request.rule_version, version])?;
         for (position, state) in request.states.iter().enumerate() {
             check_cancelled(cancelled)?;
             let observation = state
@@ -300,15 +243,13 @@ impl SnapshotStore {
                 .as_ref()
                 .map(|location| observation_id(&transaction, location, &version))
                 .transpose()?;
-            transaction.execute("INSERT INTO analysis_states(target_id,commit_id,rule_version,version,position,location,kind,evidence,observation_id)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![request.target_id, request.metadata.commit_id, request.rule_version,
+            transaction.prepare_cached("INSERT INTO analysis_states(target_id,commit_id,rule_version,version,position,location,kind,evidence,observation_id)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?.execute(params![request.target_id, request.metadata.commit_id, request.rule_version,
                     version, i64::try_from(position)?, serde_json::to_vec(&state.location)?, state.kind, state.evidence,observation])?;
         }
         check_cancelled(cancelled)?;
-        transaction.execute(
-            "INSERT INTO checkpoints(target_id,rule_version,version,commit_id) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(target_id,rule_version,version) DO UPDATE SET commit_id=excluded.commit_id",
-            params![
+        transaction.prepare_cached("INSERT INTO checkpoints(target_id,rule_version,version,commit_id) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(target_id,rule_version,version) DO UPDATE SET commit_id=excluded.commit_id")?.execute(params![
                 request.target_id,
                 request.rule_version,
                 version,
@@ -328,8 +269,7 @@ impl SnapshotStore {
         let Some(version) = find_version(&self.connection, version)? else {
             return Ok(None);
         };
-        Ok(self.connection.query_row("SELECT commit_id FROM checkpoints WHERE target_id=?1 AND rule_version=?2 AND version=?3",
-            params![target_id, rule_version, version], |row| row.get(0)).optional()?)
+        Ok(self.connection.prepare_cached("SELECT commit_id FROM checkpoints WHERE target_id=?1 AND rule_version=?2 AND version=?3")?.query_row(params![target_id, rule_version, version], |row| row.get(0)).optional()?)
     }
 
     pub fn load_edges(
@@ -423,8 +363,7 @@ impl SnapshotStore {
         let Some(version) = find_version(&self.connection, version)? else {
             return Ok(Vec::new());
         };
-        let observation:Option<i64>=self.connection.query_row("SELECT observation_id FROM observations WHERE commit_id=?1 AND path=?2 AND blob_id=?3 AND version=?4 AND symbol_index=?5",
-            params![location.commit_id,location.path,location.blob_id,version,i64::try_from(location.symbol_index)?],|row|row.get(0)).optional()?;
+        let observation:Option<i64>=self.connection.prepare_cached("SELECT observation_id FROM observations WHERE commit_id=?1 AND path=?2 AND blob_id=?3 AND version=?4 AND symbol_index=?5")?.query_row(params![location.commit_id,location.path,location.blob_id,version,i64::try_from(location.symbol_index)?],|row|row.get(0)).optional()?;
         let Some(observation) = observation else {
             return Ok(Vec::new());
         };
@@ -458,7 +397,7 @@ impl SnapshotStore {
         version: &str,
         observation: Option<i64>,
     ) -> Result<Vec<StoredState>> {
-        let mut statement=self.connection.prepare("SELECT location,kind,evidence FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4 AND observation_id IS ?5 ORDER BY position")?;
+        let mut statement=self.connection.prepare_cached("SELECT location,kind,evidence FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4 AND observation_id IS ?5 ORDER BY position")?;
         let rows = statement.query_map(
             params![target_id, commit_id, rule_version, version, observation],
             |row| {
@@ -491,7 +430,7 @@ impl SnapshotStore {
         let Some(version) = find_version(&self.connection, version)? else {
             return Ok(Vec::new());
         };
-        let mut statement=self.connection.prepare("SELECT location,kind,evidence FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4 ORDER BY position")?;
+        let mut statement=self.connection.prepare_cached("SELECT location,kind,evidence FROM analysis_states WHERE target_id=?1 AND commit_id=?2 AND rule_version=?3 AND version=?4 ORDER BY position")?;
         let rows = statement.query_map(
             params![target_id, commit_id, rule_version, version],
             |row| {
@@ -523,8 +462,7 @@ impl SnapshotStore {
         let Some(version) = find_version(&self.connection, version)? else {
             return Ok(0);
         };
-        let count:i64=self.connection.query_row("SELECT COUNT(DISTINCT commit_id) FROM analysis_states WHERE target_id=?1 AND rule_version=?2 AND version=?3 AND lower(kind) IN ('unknown','incomplete','skippedfile','skipped_file')",
-            params![target_id,rule_version,version],|row|row.get(0))?;
+        let count:i64=self.connection.prepare_cached("SELECT COUNT(DISTINCT commit_id) FROM analysis_states WHERE target_id=?1 AND rule_version=?2 AND version=?3 AND lower(kind) IN ('unknown','incomplete','skippedfile','skipped_file')")?.query_row(params![target_id,rule_version,version],|row|row.get(0))?;
         Ok(usize::try_from(count)?)
     }
 
@@ -549,7 +487,7 @@ impl SnapshotStore {
             JOIN observations a ON a.observation_id=e.before_id JOIN observations b ON b.observation_id=e.after_id
             JOIN match_evidence v ON v.edge_id=e.edge_id WHERE b.commit_id=?1 AND b.version=?3 AND e.rule_version=?2 AND e.version=?3 AND e.decision=?7
             {location_predicate} ORDER BY b.path,b.symbol_index,a.path,a.symbol_index");
-        let mut statement = self.connection.prepare(&sql)?;
+        let mut statement = self.connection.prepare_cached(&sql)?;
         let rows = statement.query_map(
             params![
                 commit_id,
@@ -586,7 +524,7 @@ impl SnapshotStore {
             let (id, before, after, evidence) = row?;
             let mut events = self
                 .connection
-                .prepare("SELECT kind FROM events WHERE edge_id=?1 ORDER BY kind")?;
+                .prepare_cached("SELECT kind FROM events WHERE edge_id=?1 ORDER BY kind")?;
             let events = events
                 .query_map([id], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -608,16 +546,13 @@ impl SnapshotStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("INSERT INTO snapshot_counts VALUES(?1,?2,?3,?4) ON CONFLICT(commit_id) DO UPDATE SET
-            file_count=excluded.file_count,symbol_count=excluded.symbol_count,skipped_count=excluded.skipped_count",
-            params![commit_id,i64::try_from(snapshot.files.len())?,i64::try_from(snapshot.symbol_count())?,i64::try_from(snapshot.skipped.len())?])?;
+        transaction.prepare_cached("INSERT INTO snapshot_counts VALUES(?1,?2,?3,?4) ON CONFLICT(commit_id) DO UPDATE SET
+            file_count=excluded.file_count,symbol_count=excluded.symbol_count,skipped_count=excluded.skipped_count")?.execute(params![commit_id,i64::try_from(snapshot.files.len())?,i64::try_from(snapshot.symbol_count())?,i64::try_from(snapshot.skipped.len())?])?;
         finish(transaction, &self.path, self.budget)
     }
 
     pub fn recorded_counts(&self, commit_id: &str) -> Result<(usize, usize, usize)> {
-        let (files, symbols, skipped): (i64, i64, i64) = self.connection.query_row(
-            "SELECT file_count,symbol_count,skipped_count FROM snapshot_counts WHERE commit_id=?1",
-            [commit_id],
+        let (files, symbols, skipped): (i64, i64, i64) = self.connection.prepare_cached("SELECT file_count,symbol_count,skipped_count FROM snapshot_counts WHERE commit_id=?1")?.query_row([commit_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         Ok((
@@ -641,6 +576,126 @@ impl SnapshotStore {
         );
         Ok(())
     }
+}
+
+fn read_parse(
+    connection: &Connection,
+    blob_id: &str,
+    version: ExtractorVersion,
+) -> Result<Option<ParsedRust>> {
+    let Some(key) = find_version(connection, version)? else {
+        return Ok(None);
+    };
+    let payload: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT payload FROM parse_units WHERE blob_id=?1 AND version=?2",
+            params![blob_id, key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|payload| {
+            let parsed: ParsePayload = serde_json::from_slice(&payload)
+                .context("The cached parse metadata is invalid.")?;
+            let mut statement=connection.prepare_cached("SELECT symbol_index,payload FROM extracted_symbols WHERE blob_id=?1 AND version=?2 ORDER BY symbol_index")?;
+            let rows=statement.query_map(params![blob_id,key],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?)))?;
+            let mut symbols=Vec::new();
+            for row in rows {
+                let (index,payload)=row?;
+                ensure!(usize::try_from(index).ok()==Some(symbols.len()), "The extracted symbol cache has incomplete indices.");
+                symbols.push(decode_symbol(&payload).context("The cached symbol metadata is invalid.")?);
+            }
+            ensure!(symbols.len()==parsed.symbol_count,"The extracted symbol cache is incomplete.");
+            Ok(ParsedRust::new(
+                symbols,
+                parsed.has_error,
+                version,
+                parsed.diagnostics,
+                parsed.unsupported,
+            ))
+        })
+        .transpose()
+}
+
+struct EncodedParse {
+    payload: Vec<u8>,
+    symbols: Vec<Vec<u8>>,
+}
+
+impl EncodedParse {
+    fn estimate(&self) -> Result<usize> {
+        self.symbols
+            .iter()
+            .try_fold(self.payload.len(), |total, symbol| {
+                total
+                    .checked_add(symbol.len() + 256)
+                    .context("Parse cache size overflow")
+            })
+    }
+}
+
+fn encode_parse(parsed: &ParsedRust) -> Result<EncodedParse> {
+    Ok(EncodedParse {
+        payload: serde_json::to_vec(&ParsePayload {
+            symbol_count: parsed.symbols.len(),
+            has_error: parsed.has_error,
+            diagnostics: parsed.diagnostics.clone(),
+            unsupported: parsed.unsupported.clone(),
+        })?,
+        symbols: parsed
+            .symbols
+            .iter()
+            .map(encode_symbol)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+/// Parse units are immutable per blob and extractor version: an existing entry
+/// must match exactly, or the cache is inconsistent.
+fn existing_parse_matches(
+    connection: &Connection,
+    blob_id: &str,
+    parsed: &ParsedRust,
+    encoded: &EncodedParse,
+) -> Result<bool> {
+    let Some(version) = find_version(connection, parsed.version)? else {
+        return Ok(false);
+    };
+    let existing: Option<Vec<u8>> = connection
+        .prepare_cached("SELECT payload FROM parse_units WHERE blob_id=?1 AND version=?2")?
+        .query_row(params![blob_id, version], |row| row.get(0))
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    ensure!(
+        existing == encoded.payload,
+        "The immutable parse cache entry differs for the same blob and extractor version."
+    );
+    // Compare decoded symbols so legacy JSON rows and compact rows agree.
+    let cached = read_parse(connection, blob_id, parsed.version)?
+        .context("The immutable parse cache entry is incomplete.")?;
+    ensure!(
+        cached.symbols == parsed.symbols,
+        "The immutable extracted symbol cache differs for the same blob and extractor version."
+    );
+    Ok(true)
+}
+
+fn insert_parse(
+    transaction: &Transaction<'_>,
+    blob_id: &str,
+    version: ExtractorVersion,
+    encoded: &EncodedParse,
+) -> Result<()> {
+    let version = intern_version(transaction, version)?;
+    transaction
+        .prepare_cached("INSERT INTO parse_units(blob_id,version,payload) VALUES(?1,?2,?3)")?
+        .execute(params![blob_id, version, encoded.payload])?;
+    for (index, symbol) in encoded.symbols.iter().enumerate() {
+        transaction.prepare_cached("INSERT INTO extracted_symbols(blob_id,version,symbol_index,payload) VALUES(?1,?2,?3,?4)")?.execute(params![blob_id, version, i64::try_from(index)?, symbol])?;
+    }
+    Ok(())
 }
 
 fn version_key(version: ExtractorVersion) -> String {
@@ -668,10 +723,9 @@ fn find_version(connection: &Connection, version: ExtractorVersion) -> Result<Op
 }
 
 fn intern_version(transaction: &Transaction<'_>, version: ExtractorVersion) -> Result<String> {
-    transaction.execute(
-        "INSERT OR IGNORE INTO extractor_versions(key) VALUES(?1)",
-        [version_key(version)],
-    )?;
+    transaction
+        .prepare_cached("INSERT OR IGNORE INTO extractor_versions(key) VALUES(?1)")?
+        .execute([version_key(version)])?;
     find_version(transaction, version)?.context("The extractor version was not interned.")
 }
 
@@ -691,21 +745,18 @@ fn migrate_interned_versions(transaction: &Transaction<'_>) -> Result<()> {
     // Parent and child keys change in separate statements within one transaction.
     transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
     for table in TABLES {
-        transaction.execute(
-            &format!(
+        transaction
+            .prepare_cached(&format!(
                 "INSERT OR IGNORE INTO extractor_versions(key)
                 SELECT DISTINCT version FROM {table} WHERE version LIKE '[%'"
-            ),
-            [],
-        )?;
+            ))?
+            .execute([])?;
     }
     for table in TABLES {
-        transaction.execute(
-            &format!(
+        transaction.prepare_cached(&format!(
                 "UPDATE {table} SET version=(SELECT CAST(version_id AS TEXT) FROM extractor_versions WHERE key={table}.version)
                 WHERE version LIKE '[%'"
-            ),
-            [],
+            ))?.execute([],
         )?;
     }
     Ok(())
@@ -918,21 +969,24 @@ fn observation_id(
     version: &str,
 ) -> Result<i64> {
     // Materialize only endpoints and explicit states, never every unchanged symbol.
-    transaction.execute(
-        "INSERT OR IGNORE INTO observations(commit_id,path,blob_id,version,symbol_index)
+    let inserted = transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO observations(commit_id,path,blob_id,version,symbol_index)
         SELECT f.commit_id,f.path,f.blob_id,s.version,s.symbol_index FROM commit_files f
         JOIN extracted_symbols s ON s.blob_id=f.blob_id
         WHERE f.commit_id=?1 AND f.path=?2 AND f.blob_id=?3 AND s.version=?4 AND s.symbol_index=?5",
-        params![
+        )?
+        .execute(params![
             location.commit_id,
             location.path,
             location.blob_id,
             version,
             i64::try_from(location.symbol_index)?
-        ],
-    )?;
-    transaction.query_row("SELECT observation_id FROM observations WHERE commit_id=?1 AND path=?2 AND blob_id=?3 AND version=?4 AND symbol_index=?5",
-        params![location.commit_id,location.path,location.blob_id,version,i64::try_from(location.symbol_index)?],|row|row.get(0))
+        ])?;
+    if inserted == 1 {
+        return Ok(transaction.last_insert_rowid());
+    }
+    transaction.prepare_cached("SELECT observation_id FROM observations WHERE commit_id=?1 AND path=?2 AND blob_id=?3 AND version=?4 AND symbol_index=?5")?.query_row(params![location.commit_id,location.path,location.blob_id,version,i64::try_from(location.symbol_index)?],|row|row.get(0))
         .context("A lineage endpoint has no cached symbol observation.")
 }
 
@@ -949,18 +1003,23 @@ fn store_edge(
 ) -> Result<()> {
     let before_id = observation_id(transaction, before, version)?;
     let after_id = observation_id(transaction, after, version)?;
-    transaction.execute("INSERT OR IGNORE INTO lineage_edges(before_id,after_id,rule_version,version,decision) VALUES(?1,?2,?3,?4,?5)",
-        params![before_id,after_id,rule,version,decision])?;
-    let id:i64 = transaction.query_row("SELECT edge_id FROM lineage_edges WHERE before_id=?1 AND after_id=?2 AND rule_version=?3 AND version=?4 AND decision=?5",
-        params![before_id,after_id,rule,version,decision],|row|row.get(0))?;
-    transaction.execute("DELETE FROM events WHERE edge_id=?1", [id])?;
+    let inserted = transaction.prepare_cached("INSERT OR IGNORE INTO lineage_edges(before_id,after_id,rule_version,version,decision) VALUES(?1,?2,?3,?4,?5)")?.execute(params![before_id,after_id,rule,version,decision])?;
+    // A new edge cannot have events yet; an existing one is rewritten in place.
+    let id = if inserted == 1 {
+        transaction.last_insert_rowid()
+    } else {
+        let id:i64 = transaction.prepare_cached("SELECT edge_id FROM lineage_edges WHERE before_id=?1 AND after_id=?2 AND rule_version=?3 AND version=?4 AND decision=?5")?.query_row(params![before_id,after_id,rule,version,decision],|row|row.get(0))?;
+        transaction
+            .prepare_cached("DELETE FROM events WHERE edge_id=?1")?
+            .execute([id])?;
+        id
+    };
     for event in events {
-        transaction.execute(
-            "INSERT OR IGNORE INTO events(edge_id,kind) VALUES(?1,?2)",
-            params![id, event],
-        )?;
+        transaction
+            .prepare_cached("INSERT OR IGNORE INTO events(edge_id,kind) VALUES(?1,?2)")?
+            .execute(params![id, event])?;
     }
-    transaction.execute("INSERT INTO match_evidence(edge_id,evidence) VALUES(?1,?2) ON CONFLICT(edge_id) DO UPDATE SET evidence=excluded.evidence",params![id,evidence])?;
+    transaction.prepare_cached("INSERT INTO match_evidence(edge_id,evidence) VALUES(?1,?2) ON CONFLICT(edge_id) DO UPDATE SET evidence=excluded.evidence")?.execute(params![id,evidence])?;
     Ok(())
 }
 

@@ -11,6 +11,7 @@ use std::{fs, path::Path, sync::atomic::AtomicBool};
 fn request(commit: &str, blob: &str, path: &[u8]) -> StoreCommit {
     StoreCommit {
         target_id: "target".into(),
+        parses: Vec::new(),
         metadata: CommitMetadata {
             commit_id: commit.into(),
             tree_id: format!("tree-{commit}"),
@@ -645,5 +646,47 @@ fn compact_symbols_roundtrip_read_legacy_json_and_reject_corruption() -> Result<
         [],
     )?;
     assert!(store.load_parse("blob", parsed.version).is_err());
+    Ok(())
+}
+
+#[test]
+fn commit_persists_new_parses_atomically() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cache.db");
+    let mut store = SnapshotStore::open(&path)?;
+    let parsed = std::sync::Arc::new(parse()?);
+    let mut root = request("root", "blob", b"lib.rs");
+    root.parses = vec![
+        ("blob".into(), parsed.clone()),
+        ("blob".into(), parsed.clone()),
+    ];
+    root.states.push(StoredState {
+        location: Some(location("root", "blob", b"lib.rs")),
+        kind: "Created".into(),
+        evidence: "with parse".into(),
+    });
+    assert!(store.record_commit(&root, &AtomicBool::new(true)).is_err());
+    assert!(store.load_parse("blob", parsed.version)?.is_none());
+    assert_eq!(scalar(&path, "SELECT COUNT(*) FROM checkpoints")?, 0);
+    store.record_commit(&root, &AtomicBool::new(false))?;
+    assert_eq!(
+        store
+            .load_parse("blob", parsed.version)?
+            .context("Parse stored with its commit")?
+            .symbols,
+        parsed.symbols
+    );
+    assert_eq!(scalar(&path, "SELECT COUNT(*) FROM parse_units")?, 1);
+    assert_eq!(
+        store
+            .load_location_states(
+                "target",
+                &location("root", "blob", b"lib.rs"),
+                "rule-1",
+                parsed.version
+            )?
+            .len(),
+        1
+    );
     Ok(())
 }

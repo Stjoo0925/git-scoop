@@ -4,7 +4,10 @@ use crate::{
         self, CommitMetadata, History, HistoryBoundary, RustFile, SkippedFile, Snapshot, TreeFile,
     },
     lineage::{self, IncompleteReason, ObservationId, UnmatchedState},
-    store::{SnapshotStore, StoreCommit, StoredCandidate, StoredEdge, StoredLocation, StoredState},
+    store::{
+        NewParse, SnapshotStore, StoreCommit, StoredCandidate, StoredEdge, StoredLocation,
+        StoredState,
+    },
     syntax::{EXTRACTOR_VERSION, extract_rust},
 };
 use anyhow::{Context, Result, ensure};
@@ -87,33 +90,37 @@ pub fn analyze(
         }
         None => 0,
     };
+    // A resumed baseline normally hits the parse cache. Any parse it had to
+    // recompute is persisted with the next commit, whose edges reference it.
+    let mut pending_parses = Vec::new();
     let mut previous = if resumed > 0 {
-        Some(
-            snapshot(
-                repository,
-                ordered[resumed - 1],
-                &mut store,
-                None,
-                &history.boundary,
-                cancelled,
-            )?
-            .0,
-        )
+        let (baseline, _, parses) = snapshot(
+            repository,
+            ordered[resumed - 1],
+            &store,
+            None,
+            &history.boundary,
+            cancelled,
+        )?;
+        pending_parses = parses;
+        Some(baseline)
     } else {
         None
     };
     for (index, metadata) in ordered.iter().enumerate().skip(resumed) {
         check_cancelled(cancelled)?;
-        let (current, files) = snapshot(
+        let (current, files, mut parses) = snapshot(
             repository,
             metadata,
-            &mut store,
+            &store,
             previous.as_ref(),
             &history.boundary,
             cancelled,
         )?;
+        parses.append(&mut pending_parses);
         let mut request = StoreCommit {
             target_id: target.clone(),
+            parses,
             metadata: (*metadata).clone(),
             files,
             edges: Vec::new(),
@@ -232,11 +239,11 @@ pub fn analyze(
 fn snapshot(
     repository: &Path,
     metadata: &CommitMetadata,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     previous: Option<&Snapshot>,
     boundary: &HistoryBoundary,
     cancelled: &AtomicBool,
-) -> Result<(Snapshot, Vec<TreeFile>)> {
+) -> Result<(Snapshot, Vec<TreeFile>, Vec<NewParse>)> {
     let files = git::list_rust_files(repository, &metadata.commit_id, cancelled)?;
     let common_dir = gix::open(repository)?.common_dir().canonicalize()?;
     let mut result = Snapshot {
@@ -263,6 +270,9 @@ fn snapshot(
             reused.insert(&file.blob_id, file);
         }
     }
+    // Blobs first seen in this commit; copies within the commit share them.
+    let mut loaded_here: BTreeMap<String, (Arc<str>, Arc<ParsedRust>)> = BTreeMap::new();
+    let mut new_parses = Vec::new();
     let mut bytes = files
         .iter()
         .map(|f| f.path.capacity() + f.object_id.capacity() + std::mem::size_of::<TreeFile>())
@@ -275,6 +285,13 @@ fn snapshot(
                 blob_id: file.object_id.clone(),
                 source: old.source.clone(),
                 parsed: old.parsed.clone(),
+            }
+        } else if let Some((source, parsed)) = loaded_here.get(&file.object_id) {
+            RustFile {
+                path: file.path.clone(),
+                blob_id: file.object_id.clone(),
+                source: source.clone(),
+                parsed: parsed.clone(),
             }
         } else {
             let source = match git::read_blob(repository, &file.object_id, cancelled) {
@@ -289,19 +306,21 @@ fn snapshot(
                 }
             };
             let parsed = match store.load_parse(&file.object_id, EXTRACTOR_VERSION)? {
-                Some(parsed) => parsed,
+                Some(parsed) => Arc::new(parsed),
                 None => {
-                    let parsed = extract_rust(&source)?;
+                    let parsed = Arc::new(extract_rust(&source)?);
                     check_cancelled(cancelled)?;
-                    store.save_parse(&file.object_id, &parsed)?;
+                    new_parses.push((file.object_id.clone(), parsed.clone()));
                     parsed
                 }
             };
+            let source: Arc<str> = Arc::from(source);
+            loaded_here.insert(file.object_id.clone(), (source.clone(), parsed.clone()));
             RustFile {
                 path: file.path.clone(),
                 blob_id: file.object_id.clone(),
-                source: Arc::from(source),
-                parsed: Arc::new(parsed),
+                source,
+                parsed,
             }
         };
         // Count shared units conservatively once per file; transient before/after
@@ -309,7 +328,7 @@ fn snapshot(
         bytes = bytes
             .checked_add(
                 loaded.source.len()
-                    + parsed_size(&loaded.parsed)
+                    + loaded.parsed.owned_bytes()
                     + loaded.path.capacity()
                     + loaded.blob_id.capacity(),
             )
@@ -320,32 +339,7 @@ fn snapshot(
         );
         result.files.push(loaded);
     }
-    Ok((result, files))
-}
-
-fn parsed_size(parsed: &ParsedRust) -> usize {
-    parsed.symbols.capacity() * std::mem::size_of::<crate::Symbol>()
-        + parsed
-            .symbols
-            .iter()
-            .map(|s| {
-                s.name.capacity()
-                    + s.context.capacity() * std::mem::size_of::<String>()
-                    + s.context.iter().map(String::capacity).sum::<usize>()
-            })
-            .sum::<usize>()
-        + parsed.diagnostics.capacity() * std::mem::size_of::<crate::ParseDiagnostic>()
-        + parsed
-            .diagnostics
-            .iter()
-            .map(|d| d.syntax_kind.capacity())
-            .sum::<usize>()
-        + parsed.unsupported.capacity() * std::mem::size_of::<crate::UnsupportedSyntax>()
-        + parsed
-            .unsupported
-            .iter()
-            .map(|d| d.syntax_kind.capacity())
-            .sum::<usize>()
+    Ok((result, files, new_parses))
 }
 
 fn location(snapshot: &Snapshot, id: ObservationId) -> Result<StoredLocation> {

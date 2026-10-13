@@ -1,5 +1,5 @@
 use crate::{
-    Symbol,
+    Symbol, SymbolSummary,
     git::{HistoryBoundary, Snapshot},
 };
 use anyhow::Result;
@@ -98,17 +98,21 @@ fn symbol(snapshot: &Snapshot, id: ObservationId) -> &Symbol {
     &snapshot.files[id.file_index].parsed.symbols[id.symbol_index]
 }
 fn observations(snapshot: &Snapshot) -> Vec<ObservationId> {
-    snapshot
+    let total = snapshot
         .files
         .iter()
-        .enumerate()
-        .flat_map(|(file_index, file)| {
-            (0..file.parsed.symbols.len()).map(move |symbol_index| ObservationId {
+        .map(|file| file.parsed.symbols.len())
+        .sum();
+    let mut ids = Vec::with_capacity(total);
+    for (file_index, file) in snapshot.files.iter().enumerate() {
+        ids.extend(
+            (0..file.parsed.symbols.len()).map(|symbol_index| ObservationId {
                 file_index,
                 symbol_index,
-            })
-        })
-        .collect()
+            }),
+        );
+    }
+    ids
 }
 /// Position of each file's first observation in `observations` order.
 fn file_offsets(snapshot: &Snapshot) -> Vec<usize> {
@@ -150,6 +154,41 @@ enum MatchKey<'a> {
 type Scoped<'a> = (&'static str, &'a [String], MatchKey<'a>);
 type MatchIndex<'a> = HashMap<Scoped<'a>, Vec<usize>>;
 
+/// Fingerprints are uniform BLAKE3 output, so their leading bytes already
+/// form a well-distributed hash. Prefix sets reject unrelated symbols cheaply
+/// before exact keyed lookups; a prefix match never decides a result alone.
+#[derive(Default)]
+struct PrefixHasher(u64);
+impl std::hash::Hasher for PrefixHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+type PrefixSet = HashSet<u64, std::hash::BuildHasherDefault<PrefixHasher>>;
+
+use crate::fingerprint_prefix as prefix;
+fn copy_prefixes(item: &SymbolSummary) -> impl Iterator<Item = u64> {
+    [item.tokens_prefix].into_iter().chain(item.body_prefix)
+}
+/// Per-file compact summaries, indexed like `ObservationId`.
+fn summaries(snapshot: &Snapshot) -> Vec<&[SymbolSummary]> {
+    snapshot
+        .files
+        .iter()
+        .map(|file| file.parsed.summaries())
+        .collect()
+}
+fn summary<'a>(summaries: &[&'a [SymbolSummary]], id: ObservationId) -> &'a SymbolSummary {
+    &summaries[id.file_index][id.symbol_index]
+}
 fn proposal_keys(item: &Symbol) -> impl Iterator<Item = MatchKey<'_>> {
     [
         MatchKey::Name(&item.name),
@@ -348,21 +387,17 @@ pub fn compare_snapshots(
                 }
             }
         }
-        let preserved_old: std::collections::BTreeSet<_> = out
-            .preserved_files
-            .iter()
-            .map(|f| f.before_file_index)
-            .collect();
-        let preserved_new: std::collections::BTreeSet<_> = out
-            .preserved_files
-            .iter()
-            .map(|f| f.after_file_index)
-            .collect();
+        let mut preserved_old = vec![false; before.files.len()];
+        let mut preserved_new = vec![false; after.files.len()];
+        for file in &out.preserved_files {
+            preserved_old[file.before_file_index] = true;
+            preserved_new[file.after_file_index] = true;
+        }
         for (i, id) in old.iter().enumerate() {
-            old_used[i] = preserved_old.contains(&id.file_index);
+            old_used[i] = preserved_old[id.file_index];
         }
         for (j, id) in new.iter().enumerate() {
-            new_used[j] = preserved_new.contains(&id.file_index);
+            new_used[j] = preserved_new[id.file_index];
         }
     }
     let mut left = BTreeMap::new();
@@ -385,18 +420,25 @@ pub fn compare_snapshots(
     let mut halted = !versions_match || cancelled_early;
     // Only bodies of unmatched new observations are ever looked up, so
     // preserved files contribute just the entries that can conflict.
-    let queried_bodies: HashSet<_> = right
+    let queried_bodies: PrefixSet = right
         .values()
         .flatten()
         .filter_map(|&j| symbol(after, new[j]).fingerprints.body)
+        .map(|body| prefix(&body))
         .collect();
+    let old_summaries = summaries(before);
+    let new_summaries = summaries(after);
     let mut surviving_bodies = HashMap::new();
     let mut copy_conflicts = vec![false; new.len()];
     for (i, id) in old.iter().enumerate().filter(|(i, _)| old_used[*i]) {
-        let item = symbol(before, *id);
-        if let Some(body) = item.fingerprints.body
-            && queried_bodies.contains(&body)
+        if !summary(&old_summaries, *id)
+            .body_prefix
+            .is_some_and(|body| queried_bodies.contains(&body))
         {
+            continue;
+        }
+        let item = symbol(before, *id);
+        if let Some(body) = item.fingerprints.body {
             surviving_bodies
                 .entry((item.kind.label(), item.context.as_slice(), body))
                 .or_insert(i);
@@ -483,6 +525,10 @@ pub fn compare_snapshots(
     // Unmatched new observations can become proposals or copy targets; linked
     // ones can only be copy targets. Only pairs sharing a key are compared and
     // counted, so unrelated symbols elsewhere in the tree cost no budget.
+    let open_copies: PrefixSet = (0..new.len())
+        .filter(|j| !new_used[*j] && valid(after, new[*j]))
+        .flat_map(|j| copy_prefixes(summary(&new_summaries, new[j])))
+        .collect();
     let open_new = index_entries(
         after,
         &new,
@@ -499,10 +545,19 @@ pub fn compare_snapshots(
             copy_keys(item).map(|key| (item.kind.label(), item.context.as_slice(), key))
         })
         .collect();
+    let link_copies: PrefixSet = (0..old.len())
+        .filter(|i| !old_used[*i] && valid(before, old[*i]))
+        .flat_map(|i| copy_prefixes(summary(&old_summaries, old[i])))
+        .collect();
     let linked_new = index_entries(
         after,
         &new,
-        (0..new.len()).filter(|j| new_used[*j] && valid(after, new[*j])),
+        (0..new.len()).filter(|j| {
+            new_used[*j]
+                && copy_prefixes(summary(&new_summaries, new[*j]))
+                    .any(|key| link_copies.contains(&key))
+                && valid(after, new[*j])
+        }),
         |item| copy_keys(item).collect(),
         Some(&queried_links),
     );
@@ -516,7 +571,11 @@ pub fn compare_snapshots(
             halted = true;
             break;
         }
-        if !valid(before, *a) {
+        let compact = summary(&old_summaries, *a);
+        if compact.has_error || before.files[a.file_index].parsed.has_error {
+            continue;
+        }
+        if old_used[i] && !copy_prefixes(compact).any(|key| open_copies.contains(&key)) {
             continue;
         }
         let item = symbol(before, *a);

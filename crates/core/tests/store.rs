@@ -18,6 +18,8 @@ fn request(commit: &str, blob: &str, path: &[u8]) -> StoreCommit {
             parents: Vec::new(),
             message: "metadata".into(),
             unanalyzed_parents: Vec::new(),
+            author: "Author".into(),
+            authored_at: Some(1_700_000_000),
         },
         files: vec![TreeFile {
             path: path.to_vec(),

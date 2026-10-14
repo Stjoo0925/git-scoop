@@ -970,19 +970,7 @@ fn star_icon(
 }
 
 fn logo(ui: &mut egui::Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, size * 0.26, ACCENT);
-    let x = rect.left() + size * 0.36;
-    let top = egui::pos2(x, rect.top() + size * 0.24);
-    let bottom = egui::pos2(x, rect.bottom() - size * 0.24);
-    let branch = egui::pos2(rect.right() - size * 0.28, rect.center().y);
-    let stroke = Stroke::new(size * 0.08, Color32::WHITE);
-    painter.line_segment([top, bottom], stroke);
-    painter.line_segment([egui::pos2(x, rect.top() + size * 0.36), branch], stroke);
-    for point in [top, bottom, branch] {
-        painter.circle_filled(point, size * 0.11, Color32::WHITE);
-    }
+    crate::branding::show(ui, size);
 }
 
 /// The primary way in: a dashed target that lights up while files hover.

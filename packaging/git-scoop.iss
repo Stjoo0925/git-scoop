@@ -29,6 +29,7 @@ InfoAfterFile={#PayloadDir}\INSTALLATION.txt
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\branding\git-scoop.ico
 CloseApplications=yes
 RestartApplications=no
 #ifdef TestMode

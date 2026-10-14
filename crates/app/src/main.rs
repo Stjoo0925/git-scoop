@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod branding;
 mod highlight;
 mod present;
 mod recent;
@@ -26,6 +27,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Git Scoop")
+            .with_icon(branding::icon())
             .with_inner_size([1320.0, 860.0])
             .with_min_inner_size([960.0, 640.0])
             .with_drag_and_drop(true),

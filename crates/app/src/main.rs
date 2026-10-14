@@ -379,6 +379,10 @@ impl GitScoop {
             recent::RecentRepository {
                 path: loaded.repository.clone(),
                 revision: self.revision.trim().to_owned(),
+                opened_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok()),
             },
         );
     }

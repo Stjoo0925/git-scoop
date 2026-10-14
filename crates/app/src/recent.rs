@@ -9,6 +9,9 @@ const LIMIT: usize = 8;
 pub struct RecentRepository {
     pub path: PathBuf,
     pub revision: String,
+    /// Unix seconds of the last successful analysis; absent in older lists.
+    #[serde(default)]
+    pub opened_at: Option<i64>,
 }
 
 impl RecentRepository {
@@ -80,6 +83,7 @@ mod tests {
                 RecentRepository {
                     path: PathBuf::from(format!("repo-{index}")),
                     revision: "HEAD".into(),
+                    opened_at: Some(index),
                 },
             )?;
         }
@@ -89,6 +93,7 @@ mod tests {
             RecentRepository {
                 path: PathBuf::from("repo-5"),
                 revision: "main".into(),
+                opened_at: Some(100),
             },
         )?;
         let loaded = load(root.path());
@@ -109,6 +114,12 @@ mod tests {
                 .iter()
                 .all(|item| item.path != Path::new("repo-5"))
         );
+        // Lists written before `opened_at` existed still load.
+        std::fs::write(
+            file(root.path()),
+            br#"[{"path":"legacy","revision":"HEAD"}]"#,
+        )?;
+        assert_eq!(load(root.path())[0].opened_at, None);
         std::fs::write(file(root.path()), b"not json")?;
         assert!(load(root.path()).is_empty());
         Ok(())

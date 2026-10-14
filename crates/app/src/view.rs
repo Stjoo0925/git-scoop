@@ -134,66 +134,101 @@ impl GitScoop {
     // ---------------------------------------------------------------- start
 
     fn start_screen(&mut self, ui: &mut egui::Ui) {
-        let palette = Palette::of(ui);
-        let width = ui.available_width().clamp(320.0, 620.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.08).clamp(16.0, 72.0));
-                ui.label(RichText::new("Git Scoop").size(32.0).strong().color(palette.strong()));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "See where every Rust function and type came from: when it was created, renamed, moved, and changed.",
-                    )
-                    .size(15.0)
-                    .color(palette.muted()),
-                );
-                ui.add_space(22.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, 0.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        theme::card(ui).show(ui, |ui| {
-                            ui.set_width(width - 30.0);
-                            self.open_form(ui);
-                        });
-                        if !self.recent.is_empty() {
-                            ui.add_space(14.0);
-                            theme::card(ui).show(ui, |ui| {
-                                ui.set_width(width - 30.0);
-                                self.recent_list(ui);
-                            });
-                        }
-                        ui.add_space(14.0);
-                        how_it_works(ui);
-                        ui.add_space(14.0);
-                        ui.label(
-                            RichText::new(
-                                "Works offline and reads committed history only. Your files, branches, and working tree are never changed.",
-                            )
-                            .small()
-                            .color(palette.muted()),
-                        );
-                    },
-                );
-            });
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            egui::widgets::global_theme_preference_switch(ui);
         });
+        // Two columns on wide windows: what the app does, then the one thing
+        // to do next. Narrow windows put that action right after the heading.
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let total = ui.available_width();
+            let wide = total >= 1060.0;
+            // Stacked layouts keep a readable line length.
+            let content = if wide {
+                total.min(1080.0) - 48.0
+            } else {
+                total.min(680.0) - 48.0
+            };
+            ui.add_space((ui.available_height() * 0.1).clamp(24.0, 96.0));
+            ui.horizontal_top(|ui| {
+                ui.add_space(((total - content) / 2.0).max(24.0));
+                if wide {
+                    let gap = 56.0;
+                    let left = (content - gap) * 0.5;
+                    let right = content - gap - left;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.add_space(12.0);
+                            hero_heading(ui);
+                            ui.add_space(28.0);
+                            hero_points(ui);
+                        },
+                    );
+                    ui.add_space(gap);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(right, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| self.open_column(ui, right),
+                    );
+                } else {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(content, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            // The action comes before the details when stacked.
+                            hero_heading(ui);
+                            ui.add_space(24.0);
+                            self.open_column(ui, content);
+                            ui.add_space(28.0);
+                            hero_points(ui);
+                        },
+                    );
+                }
+            });
+            ui.add_space(32.0);
+        });
+    }
+
+    fn open_column(&mut self, ui: &mut egui::Ui, width: f32) {
+        theme::card(ui)
+            .inner_margin(egui::Margin::same(20))
+            .show(ui, |ui| {
+                ui.set_width(width - 42.0);
+                self.open_form(ui);
+            });
+        if !self.recent.is_empty() {
+            ui.add_space(20.0);
+            self.recent_list(ui, width);
+        }
     }
 
     fn open_form(&mut self, ui: &mut egui::Ui) {
         let palette = Palette::of(ui);
         let busy = self.analyzing();
-        ui.label(RichText::new("Repository folder").strong());
+        ui.label(
+            RichText::new("Open a repository")
+                .size(18.0)
+                .color(palette.strong()),
+        );
+        ui.add_space(12.0);
+        drop_zone(ui, busy);
+        ui.add_space(14.0);
+        ui.label(RichText::new("Folder path").small().color(palette.muted()));
         let path = ui.add_enabled(
             !busy,
             egui::TextEdit::singleline(&mut self.path)
                 .id(egui::Id::new(PATH_INPUT))
                 .hint_text("C:\\Projects\\my-crate")
-                .margin(egui::Margin::symmetric(8, 6))
+                .margin(egui::Margin::symmetric(10, 8))
                 .desired_width(f32::INFINITY),
         );
-        ui.add_space(6.0);
-        ui.label(RichText::new("Branch, tag, or commit").strong());
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("Branch, tag, or commit")
+                .small()
+                .color(palette.muted()),
+        );
         let mut start = false;
         ui.horizontal(|ui| {
             let revision = ui.add_enabled(
@@ -201,44 +236,45 @@ impl GitScoop {
                 egui::TextEdit::singleline(&mut self.revision)
                     .id(egui::Id::new(REVISION_INPUT))
                     .hint_text("HEAD")
-                    .margin(egui::Margin::symmetric(8, 6))
-                    .desired_width(200.0),
+                    .margin(egui::Margin::symmetric(10, 8))
+                    .desired_width(160.0),
             );
             let enter = ui.input(|input| input.key_pressed(Key::Enter));
             start |= enter && (path.lost_focus() || revision.lost_focus());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if busy {
-                    if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(96.0, 36.0)))
+                        .on_hover_text("Esc")
+                        .clicked()
+                    {
                         self.cancel_analysis();
                     }
                 } else {
                     let ready = !self.path.trim().is_empty() && !self.revision.trim().is_empty();
                     let button = egui::Button::new(
-                        RichText::new("Analyze history")
-                            .color(Color32::WHITE)
-                            .strong(),
+                        RichText::new("Analyze history  →")
+                            .size(15.0)
+                            .color(Color32::WHITE),
                     )
                     .fill(ACCENT)
-                    .min_size(egui::vec2(150.0, 32.0));
-                    start |= ui.add_enabled(ready, button).clicked();
+                    .min_size(egui::vec2(172.0, 36.0));
+                    start |= ui
+                        .add_enabled(ready, button)
+                        .on_disabled_hover_text("Enter or drop a repository folder first")
+                        .clicked();
                 }
             });
         });
         if start && !busy && !self.path.trim().is_empty() {
             self.start(ui.ctx());
         }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Tip: drop a repository folder anywhere on this window.")
-                .small()
-                .color(palette.muted()),
-        );
         if busy {
-            ui.add_space(10.0);
+            ui.add_space(16.0);
             self.progress_block(ui);
         }
         if let Some(error) = self.error.clone() {
-            ui.add_space(10.0);
+            ui.add_space(16.0);
             error_box(
                 ui,
                 "Could not analyze this repository",
@@ -293,43 +329,104 @@ impl GitScoop {
         Some((elapsed / done as f64 * left as f64).ceil() as u64)
     }
 
-    fn recent_list(&mut self, ui: &mut egui::Ui) {
+    fn recent_list(&mut self, ui: &mut egui::Ui, width: f32) {
         let palette = Palette::of(ui);
-        ui.label(RichText::new("Recent").strong());
-        ui.add_space(4.0);
+        let now = now_seconds();
+        ui.label(RichText::new("RECENT").size(11.5).color(palette.muted()));
+        ui.add_space(6.0);
         let mut open = None;
         let mut forget = None;
         for item in &self.recent {
-            ui.horizontal(|ui| {
-                // Actions take their space first so long paths truncate instead.
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new("Remove").small()).frame(false))
-                        .on_hover_text("Remove from this list")
-                        .clicked()
-                    {
-                        forget = Some(item.path.clone());
-                    }
-                    theme::badge(ui, &item.revision, palette.muted());
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        let label = RichText::new(item.name()).strong().color(palette.strong());
-                        let response = ui
-                            .add(egui::Button::new(label).frame(false))
-                            .on_hover_text(item.path.display().to_string());
-                        if response.clicked() {
-                            open = Some(item.clone());
-                        }
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(item.path.display().to_string())
-                                    .small()
-                                    .color(palette.muted()),
-                            )
-                            .truncate(),
-                        );
-                    });
-                });
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 54.0), Sense::click());
+            let painter = ui.painter_at(rect);
+            let hovered = response.hovered() || response.has_focus();
+            painter.rect(
+                rect.shrink(1.0),
+                8.0,
+                if hovered {
+                    palette.selected()
+                } else {
+                    palette.card()
+                },
+                Stroke::new(1.0, if hovered { ACCENT } else { palette.border() }),
+                egui::StrokeKind::Inside,
+            );
+            // An initial avatar makes repositories recognizable at a glance.
+            let avatar = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 30.0, rect.center().y),
+                egui::vec2(32.0, 32.0),
+            );
+            painter.rect_filled(avatar, 8.0, ACCENT.gamma_multiply(0.18));
+            painter.text(
+                avatar.center(),
+                Align2::CENTER_CENTER,
+                item.name()
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string(),
+                FontId::proportional(16.0),
+                ACCENT,
+            );
+            let text_left = avatar.right() + 12.0;
+            let actions = 120.0;
+            let text_width = (rect.right() - actions - text_left).max(40.0);
+            let name = painter.layout(
+                item.name(),
+                FontId::proportional(15.0),
+                palette.strong(),
+                text_width,
+            );
+            painter.galley(
+                egui::pos2(text_left, rect.top() + 9.0),
+                name,
+                palette.strong(),
+            );
+            let mut detail = egui::text::LayoutJob::simple_singleline(
+                item.path.display().to_string(),
+                FontId::proportional(12.0),
+                palette.muted(),
+            );
+            detail.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+            painter.galley(
+                egui::pos2(text_left, rect.top() + 31.0),
+                painter.layout_job(detail),
+                palette.muted(),
+            );
+            let opened = item
+                .opened_at
+                .map(|seconds| present::when(Some(seconds), now))
+                .unwrap_or_default();
+            painter.text(
+                egui::pos2(rect.right() - 16.0, rect.top() + 18.0),
+                Align2::RIGHT_CENTER,
+                &item.revision,
+                FontId::proportional(12.5),
+                palette.strong(),
+            );
+            painter.text(
+                egui::pos2(rect.right() - 16.0, rect.top() + 37.0),
+                Align2::RIGHT_CENTER,
+                opened,
+                FontId::proportional(11.5),
+                palette.muted(),
+            );
+            let response = response.on_hover_text(format!(
+                "Open {} at {}\nRight-click to remove from this list",
+                item.path.display(),
+                item.revision
+            ));
+            if response.clicked() {
+                open = Some(item.clone());
+            }
+            response.context_menu(|ui| {
+                if ui.button("Remove from recent").clicked() {
+                    forget = Some(item.path.clone());
+                    ui.close();
+                }
             });
+            ui.add_space(4.0);
         }
         if let Some(path) = forget {
             self.forget_repository(&path);
@@ -354,7 +451,8 @@ impl GitScoop {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Git Scoop").strong().color(ACCENT));
+                    logo(ui, 20.0);
+                    ui.label(RichText::new("Git Scoop").color(palette.strong()));
                     ui.separator();
                     if let Some(loaded) = &self.loaded {
                         let name = loaded
@@ -674,59 +772,219 @@ impl GitScoop {
     }
 }
 
-/// Three steps that tell a first-time user what the app does for them.
-fn how_it_works(ui: &mut egui::Ui) {
+/// The product pitch: what the app answers.
+fn hero_heading(ui: &mut egui::Ui) {
     let palette = Palette::of(ui);
-    const STEPS: [(&str, &str); 3] = [
+    ui.horizontal(|ui| {
+        logo(ui, 30.0);
+        ui.label(
+            RichText::new("Git Scoop")
+                .size(19.0)
+                .color(palette.strong()),
+        );
+    });
+    ui.add_space(26.0);
+    ui.label(
+        // A deliberate break keeps the headline from ending on an orphan.
+        RichText::new("Know where your\ncode came from.")
+            .size(34.0)
+            .color(palette.strong()),
+    );
+    ui.add_space(12.0);
+    ui.label(
+        RichText::new(
+            "Pick any Rust function or type and follow it back through every rename, move, and edit, to the commit where it began.",
+        )
+        .size(16.0)
+        .color(palette.muted()),
+    );
+}
+
+/// Why the answers can be trusted.
+fn hero_points(ui: &mut egui::Ui) {
+    let palette = Palette::of(ui);
+    const POINTS: [(&str, &str, Tone); 3] = [
         (
-            "1  Analyze",
-            "Reads the branch history once. Later runs resume where they stopped.",
+            "Follows renames and moves",
+            "Lineage survives new names and new files, not just line edits.",
+            Tone::Identity,
         ),
         (
-            "2  Find",
-            "Search any function, method, struct, enum, or trait by name.",
+            "Shows its reasoning",
+            "Every step lists what matched. Uncertain links are never guessed.",
+            Tone::Location,
         ),
         (
-            "3  Trace",
-            "Follow each rename, move, and change back to where it started.",
+            "Private and read-only",
+            "Runs offline on committed history and never changes your files.",
+            Tone::Origin,
         ),
     ];
-    ui.columns(3, |columns| {
-        for (column, (title, body)) in columns.iter_mut().zip(STEPS) {
-            theme::card(column).show(column, |ui| {
-                ui.set_width(ui.available_width());
-                ui.set_min_height(66.0);
-                // Left-aligned layout keeps wrapped text from being justified.
-                ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    ui.label(RichText::new(title).strong().color(ACCENT));
-                    ui.label(RichText::new(body).small().color(palette.muted()));
-                });
+    for (title, body, tone) in POINTS {
+        ui.horizontal_top(|ui| {
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), Sense::hover());
+            ui.painter().circle_filled(
+                dot.center() + egui::vec2(0.0, 1.0),
+                4.5,
+                palette.tone(tone),
+            );
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).size(15.0).color(palette.strong()));
+                ui.label(RichText::new(body).color(palette.muted()));
             });
-        }
-    });
+        });
+        ui.add_space(14.0);
+    }
+}
+
+/// A small mark: a history line whose steps branch off a main trunk.
+fn logo(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, size * 0.26, ACCENT);
+    let x = rect.left() + size * 0.36;
+    let top = egui::pos2(x, rect.top() + size * 0.24);
+    let bottom = egui::pos2(x, rect.bottom() - size * 0.24);
+    let branch = egui::pos2(rect.right() - size * 0.28, rect.center().y);
+    let stroke = Stroke::new(size * 0.08, Color32::WHITE);
+    painter.line_segment([top, bottom], stroke);
+    painter.line_segment([egui::pos2(x, rect.top() + size * 0.36), branch], stroke);
+    for point in [top, bottom, branch] {
+        painter.circle_filled(point, size * 0.11, Color32::WHITE);
+    }
+}
+
+/// The primary way in: a dashed target that lights up while files hover.
+fn drop_zone(ui: &mut egui::Ui, busy: bool) {
+    let palette = Palette::of(ui);
+    let hovering = ui.ctx().input(|input| !input.raw.hovered_files.is_empty());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 112.0), Sense::hover());
+    let painter = ui.painter();
+    if hovering {
+        painter.rect_filled(rect, 10.0, ACCENT.gamma_multiply(0.10));
+    } else {
+        painter.rect_filled(rect, 10.0, palette.code_background());
+    }
+    let inset = rect.shrink(1.0);
+    painter.extend(egui::Shape::dashed_line(
+        &[
+            inset.left_top(),
+            inset.right_top(),
+            inset.right_bottom(),
+            inset.left_bottom(),
+            inset.left_top(),
+        ],
+        Stroke::new(
+            1.5,
+            if hovering {
+                ACCENT
+            } else {
+                // Muted text color reads as a border in both themes.
+                palette.muted().gamma_multiply(0.7)
+            },
+        ),
+        6.0,
+        5.0,
+    ));
+    // Folder glyph drawn with shapes so it needs no icon font.
+    let icon = egui::Rect::from_center_size(
+        rect.center() - egui::vec2(0.0, 18.0),
+        egui::vec2(34.0, 26.0),
+    );
+    let color = if hovering { ACCENT } else { palette.muted() };
+    painter.rect_filled(
+        egui::Rect::from_min_size(icon.left_top(), egui::vec2(14.0, 8.0)),
+        3.0,
+        color,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(icon.left_top() + egui::vec2(0.0, 4.0), icon.right_bottom()),
+        4.0,
+        color,
+    );
+    let (title, detail) = if busy {
+        (
+            "Analysis in progress",
+            "You can still browse once it finishes.",
+        )
+    } else if hovering {
+        (
+            "Release to analyze",
+            "The folder's committed history will be read.",
+        )
+    } else {
+        ("Drop a repository folder here", "or paste its path below")
+    };
+    painter.text(
+        rect.center() + egui::vec2(0.0, 18.0),
+        Align2::CENTER_CENTER,
+        title,
+        FontId::proportional(15.0),
+        if hovering { ACCENT } else { palette.strong() },
+    );
+    painter.text(
+        rect.center() + egui::vec2(0.0, 38.0),
+        Align2::CENTER_CENTER,
+        detail,
+        FontId::proportional(12.5),
+        palette.muted(),
+    );
 }
 
 fn empty_state(ui: &mut egui::Ui) {
     let palette = Palette::of(ui);
     ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.28);
+        ui.add_space(ui.available_height() * 0.24);
+        logo(ui, 44.0);
+        ui.add_space(16.0);
         ui.label(
-            RichText::new("Pick a symbol to see its history")
-                .size(20.0)
+            RichText::new("Pick a symbol to trace its history")
+                .size(22.0)
                 .color(palette.strong()),
         );
         ui.add_space(6.0);
         ui.label(
-            RichText::new("Search on the left, or use ↑ and ↓ to move through the list.")
+            RichText::new("You will see every step from today back to where it began.")
                 .color(palette.muted()),
         );
-        ui.label(
-            RichText::new(
-                "Each step shows what changed, who changed it, and why the link was made.",
-            )
-            .color(palette.muted()),
-        );
+        ui.add_space(22.0);
+        // Shortcuts as key caps; a fixed width keeps the rows aligned.
+        let rows: [(&[&str], &str); 3] = [
+            (&["Ctrl", "F"], "Search symbols"),
+            (&["↑", "↓"], "Move through the list"),
+            (&["Right-click"], "Copy a step's commit ID"),
+        ];
+        ui.allocate_ui_with_layout(egui::vec2(320.0, 0.0), Layout::top_down(Align::Min), |ui| {
+            for (keys, action) in rows {
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(130.0, 24.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            for key in keys.iter().rev() {
+                                key_cap(ui, key);
+                            }
+                        },
+                    );
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(action).color(palette.muted()));
+                });
+                ui.add_space(4.0);
+            }
+        });
     });
+}
+
+fn key_cap(ui: &mut egui::Ui, key: &str) {
+    let palette = Palette::of(ui);
+    egui::Frame::new()
+        .fill(palette.card())
+        .stroke(Stroke::new(1.0, palette.border()))
+        .corner_radius(5)
+        .inner_margin(egui::Margin::symmetric(7, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(key).size(12.0).color(palette.strong()));
+        });
 }
 
 fn error_box(ui: &mut egui::Ui, title: &str, message: &str, hint: &str) {

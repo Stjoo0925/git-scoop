@@ -383,6 +383,7 @@ impl GitScoop {
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()
                     .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok()),
+                saved: false,
             },
         );
     }
@@ -391,6 +392,21 @@ impl GitScoop {
         if let Some(root) = &self.cache_root {
             let _ = recent::forget(root, &mut self.recent, path);
         }
+    }
+
+    fn save_repository(&mut self, path: &std::path::Path, saved: bool) {
+        if let Some(root) = &self.cache_root {
+            let _ = recent::set_saved(root, &mut self.recent, path, saved);
+        }
+    }
+
+    /// Whether the open repository is on the saved list.
+    fn repository_saved(&self) -> Option<bool> {
+        let loaded = self.loaded.as_ref()?;
+        self.recent
+            .iter()
+            .find(|item| item.path == loaded.repository)
+            .map(|item| item.saved)
     }
 
     fn refresh_matches(&mut self) {

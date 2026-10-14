@@ -1,6 +1,7 @@
 //! Screens and panels. State changes go through `GitScoop` methods so the
 //! analysis and query workers keep their existing ownership rules.
 
+use crate::recent::RecentRepository;
 use crate::{
     DetailTab, GitScoop, KindFilter, PATH_INPUT, QueryView, REVISION_INPUT, SEARCH_INPUT,
     highlight,
@@ -15,7 +16,7 @@ use git_scoop_core::{
     git::HistoryBoundary,
     trace::{DiffKind, SourceEvidence, TraceEntry},
 };
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 const SYMBOL_ROW_HEIGHT: f32 = 46.0;
 const CODE_ROW_HEIGHT: f32 = 19.0;
@@ -332,111 +333,35 @@ impl GitScoop {
     fn recent_list(&mut self, ui: &mut egui::Ui, width: f32) {
         let palette = Palette::of(ui);
         let now = now_seconds();
-        ui.label(RichText::new("RECENT").size(11.5).color(palette.muted()));
-        ui.add_space(6.0);
-        let mut open = None;
-        let mut forget = None;
-        for item in &self.recent {
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 54.0), Sense::click());
-            let painter = ui.painter_at(rect);
-            let hovered = response.hovered() || response.has_focus();
-            painter.rect(
-                rect.shrink(1.0),
-                8.0,
-                if hovered {
-                    palette.selected()
-                } else {
-                    palette.card()
-                },
-                Stroke::new(1.0, if hovered { ACCENT } else { palette.border() }),
-                egui::StrokeKind::Inside,
-            );
-            // An initial avatar makes repositories recognizable at a glance.
-            let avatar = egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 30.0, rect.center().y),
-                egui::vec2(32.0, 32.0),
-            );
-            painter.rect_filled(avatar, 8.0, ACCENT.gamma_multiply(0.18));
-            painter.text(
-                avatar.center(),
-                Align2::CENTER_CENTER,
-                item.name()
-                    .chars()
-                    .next()
-                    .unwrap_or('?')
-                    .to_uppercase()
-                    .to_string(),
-                FontId::proportional(16.0),
-                ACCENT,
-            );
-            let text_left = avatar.right() + 12.0;
-            let actions = 120.0;
-            let text_width = (rect.right() - actions - text_left).max(40.0);
-            let name = painter.layout(
-                item.name(),
-                FontId::proportional(15.0),
-                palette.strong(),
-                text_width,
-            );
-            painter.galley(
-                egui::pos2(text_left, rect.top() + 9.0),
-                name,
-                palette.strong(),
-            );
-            let mut detail = egui::text::LayoutJob::simple_singleline(
-                item.path.display().to_string(),
-                FontId::proportional(12.0),
-                palette.muted(),
-            );
-            detail.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
-            painter.galley(
-                egui::pos2(text_left, rect.top() + 31.0),
-                painter.layout_job(detail),
-                palette.muted(),
-            );
-            let opened = item
-                .opened_at
-                .map(|seconds| present::when(Some(seconds), now))
-                .unwrap_or_default();
-            painter.text(
-                egui::pos2(rect.right() - 16.0, rect.top() + 18.0),
-                Align2::RIGHT_CENTER,
-                &item.revision,
-                FontId::proportional(12.5),
-                palette.strong(),
-            );
-            painter.text(
-                egui::pos2(rect.right() - 16.0, rect.top() + 37.0),
-                Align2::RIGHT_CENTER,
-                opened,
-                FontId::proportional(11.5),
-                palette.muted(),
-            );
-            let response = response.on_hover_text(format!(
-                "Open {} at {}\nRight-click to remove from this list",
-                item.path.display(),
-                item.revision
-            ));
-            if response.clicked() {
-                open = Some(item.clone());
+        let mut action = None;
+        let (saved, recent): (Vec<_>, Vec<_>) = self.recent.iter().partition(|item| item.saved);
+        let mut first = true;
+        for (title, items) in [("SAVED", saved), ("RECENT", recent)] {
+            if items.is_empty() {
+                continue;
             }
-            response.context_menu(|ui| {
-                if ui.button("Remove from recent").clicked() {
-                    forget = Some(item.path.clone());
-                    ui.close();
+            if !first {
+                ui.add_space(14.0);
+            }
+            first = false;
+            ui.label(RichText::new(title).size(11.5).color(palette.muted()));
+            ui.add_space(6.0);
+            for item in items {
+                if let Some(chosen) = repository_row(ui, item, width, now) {
+                    action = Some(chosen);
                 }
-            });
-            ui.add_space(4.0);
+                ui.add_space(4.0);
+            }
         }
-        if let Some(path) = forget {
-            self.forget_repository(&path);
-        }
-        if let Some(item) = open
-            && !self.analyzing()
-        {
-            self.path = item.path.display().to_string();
-            self.revision = item.revision;
-            self.start(ui.ctx());
+        match action {
+            Some(RowAction::Open(item)) if !self.analyzing() => {
+                self.path = item.path.display().to_string();
+                self.revision = item.revision;
+                self.start(ui.ctx());
+            }
+            Some(RowAction::Save(path, saved)) => self.save_repository(&path, saved),
+            Some(RowAction::Forget(path)) => self.forget_repository(&path),
+            _ => {}
         }
     }
 
@@ -444,6 +369,8 @@ impl GitScoop {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let palette = Palette::of(ui);
+        let saved_state = self.repository_saved();
+        let mut toggle = None;
         egui::Panel::top("top-bar")
             .frame(
                 egui::Frame::side_top_panel(ui.style())
@@ -462,6 +389,11 @@ impl GitScoop {
                             .unwrap_or_default();
                         ui.label(RichText::new(name).strong().color(palette.strong()))
                             .on_hover_text(loaded.repository.display().to_string());
+                        if let Some(saved) = saved_state
+                            && save_toggle(ui, saved).clicked()
+                        {
+                            toggle = Some((loaded.repository.clone(), !saved));
+                        }
                         if let Some(commit) = &loaded.snapshot.commit_id {
                             theme::badge(
                                 ui,
@@ -494,6 +426,9 @@ impl GitScoop {
                     });
                 });
             });
+        if let Some((path, saved)) = toggle {
+            self.save_repository(&path, saved);
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -838,6 +773,202 @@ fn hero_points(ui: &mut egui::Ui) {
 }
 
 /// A small mark: a history line whose steps branch off a main trunk.
+/// What the user asked for on a repository row.
+enum RowAction {
+    Open(RecentRepository),
+    Save(PathBuf, bool),
+    Forget(PathBuf),
+}
+
+/// One clickable repository row with an avatar, its location, the revision,
+/// when it was last opened, and a save toggle.
+fn repository_row(
+    ui: &mut egui::Ui,
+    item: &RecentRepository,
+    width: f32,
+    now: i64,
+) -> Option<RowAction> {
+    let palette = Palette::of(ui);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 54.0), Sense::click());
+    // Registered after the row, so it wins clicks over its own area.
+    let star_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 24.0, rect.center().y),
+        egui::vec2(28.0, 28.0),
+    );
+    let star = ui.interact(star_rect, response.id.with("save"), Sense::click());
+    let painter = ui.painter_at(rect);
+    let hovered = response.contains_pointer() || response.has_focus();
+    painter.rect(
+        rect.shrink(1.0),
+        8.0,
+        if hovered {
+            palette.selected()
+        } else {
+            palette.card()
+        },
+        Stroke::new(1.0, if hovered { ACCENT } else { palette.border() }),
+        egui::StrokeKind::Inside,
+    );
+    // An initial avatar makes repositories recognizable at a glance.
+    let avatar = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 30.0, rect.center().y),
+        egui::vec2(32.0, 32.0),
+    );
+    painter.rect_filled(avatar, 8.0, ACCENT.gamma_multiply(0.18));
+    painter.text(
+        avatar.center(),
+        Align2::CENTER_CENTER,
+        item.name()
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .to_string(),
+        FontId::proportional(16.0),
+        ACCENT,
+    );
+    let text_left = avatar.right() + 12.0;
+    let meta_right = star_rect.left() - 6.0;
+    let text_width = (meta_right - 100.0 - text_left).max(40.0);
+    let name = painter.layout(
+        item.name(),
+        FontId::proportional(15.0),
+        palette.strong(),
+        text_width,
+    );
+    painter.galley(
+        egui::pos2(text_left, rect.top() + 9.0),
+        name,
+        palette.strong(),
+    );
+    let mut detail = egui::text::LayoutJob::simple_singleline(
+        item.path.display().to_string(),
+        FontId::proportional(12.0),
+        palette.muted(),
+    );
+    detail.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+    painter.galley(
+        egui::pos2(text_left, rect.top() + 31.0),
+        painter.layout_job(detail),
+        palette.muted(),
+    );
+    let opened = item
+        .opened_at
+        .map(|seconds| present::when(Some(seconds), now))
+        .unwrap_or_default();
+    painter.text(
+        egui::pos2(meta_right, rect.top() + 18.0),
+        Align2::RIGHT_CENTER,
+        &item.revision,
+        FontId::proportional(12.5),
+        palette.strong(),
+    );
+    painter.text(
+        egui::pos2(meta_right, rect.top() + 37.0),
+        Align2::RIGHT_CENTER,
+        opened,
+        FontId::proportional(11.5),
+        palette.muted(),
+    );
+    star_icon(
+        &painter,
+        star_rect.center(),
+        item.saved,
+        star.hovered(),
+        palette,
+    );
+    let star = star.on_hover_text(if item.saved {
+        "Remove from saved"
+    } else {
+        "Save to keep this repository listed"
+    });
+    let response = response.on_hover_text(format!(
+        "Open {} at {}\nRight-click for more",
+        item.path.display(),
+        item.revision
+    ));
+    let mut action = None;
+    if star.clicked() {
+        action = Some(RowAction::Save(item.path.clone(), !item.saved));
+    } else if response.clicked() {
+        action = Some(RowAction::Open(item.clone()));
+    }
+    response.context_menu(|ui| {
+        if ui
+            .button(if item.saved { "Unsave" } else { "Save" })
+            .clicked()
+        {
+            action = Some(RowAction::Save(item.path.clone(), !item.saved));
+            ui.close();
+        }
+        if ui.button("Remove from list").clicked() {
+            action = Some(RowAction::Forget(item.path.clone()));
+            ui.close();
+        }
+    });
+    action
+}
+
+/// A clickable star that saves or unsaves a repository.
+fn save_toggle(ui: &mut egui::Ui, saved: bool) -> egui::Response {
+    let palette = Palette::of(ui);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::click());
+    star_icon(
+        ui.painter(),
+        rect.center(),
+        saved,
+        response.hovered(),
+        palette,
+    );
+    response.on_hover_text(if saved {
+        "Saved on the start screen. Click to unsave."
+    } else {
+        "Save this repository on the start screen"
+    })
+}
+
+/// A five-pointed star: filled when saved, outlined otherwise.
+fn star_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    saved: bool,
+    hovered: bool,
+    palette: Palette,
+) {
+    let radius = 8.0;
+    let points: Vec<egui::Pos2> = (0..10)
+        .map(|index| {
+            let angle = -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::PI / 5.0;
+            let distance = if index % 2 == 0 {
+                radius
+            } else {
+                radius * 0.45
+            };
+            center + distance * egui::vec2(angle.cos(), angle.sin())
+        })
+        .collect();
+    let color = if saved {
+        palette.tone(Tone::Change)
+    } else if hovered {
+        palette.strong()
+    } else {
+        palette.muted().gamma_multiply(0.8)
+    };
+    if saved {
+        // The star is concave, so fill it as a fan around its center.
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(center, color);
+        for point in &points {
+            mesh.colored_vertex(*point, color);
+        }
+        for index in 0..10 {
+            mesh.add_triangle(0, 1 + index, 1 + (index + 1) % 10);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    painter.add(egui::Shape::closed_line(points, Stroke::new(1.3, color)));
+}
+
 fn logo(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
     let painter = ui.painter();
